@@ -1,0 +1,2245 @@
+#include <stdio.h>
+#include <math.h>
+#include <stdbool.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "led_strip.h"
+#include "esp_log.h"
+#include "mpu6050.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PINES
+// ═══════════════════════════════════════════════════════════════════════════════
+#define I2C_MASTER_SDA_IO   GPIO_NUM_8
+#define I2C_MASTER_SCL_IO   GPIO_NUM_9
+#define I2C_MASTER_PORT     I2C_NUM_0
+#define I2C_SPEED_HZ        400000
+
+#define RGB_LED_PIN         GPIO_NUM_48
+#define BUZZER_PIN          GPIO_NUM_7
+#define SERVO_PIN           GPIO_NUM_10
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEDC — buzzer pasivo
+// ═══════════════════════════════════════════════════════════════════════════════
+#define BUZZER_CHANNEL      LEDC_CHANNEL_0
+#define BUZZER_TIMER        LEDC_TIMER_0
+#define BUZZER_SPEED_MODE   LEDC_LOW_SPEED_MODE
+#define BUZZER_RESOLUTION   LEDC_TIMER_10_BIT
+#define BUZZER_FREQ_ALERT   3000
+#define BUZZER_FREQ_JOLT    1500
+#define BUZZER_FREQ_WARN    2000
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEDC — servo SG90
+// ═══════════════════════════════════════════════════════════════════════════════
+#define SERVO_CHANNEL       LEDC_CHANNEL_1
+#define SERVO_TIMER         LEDC_TIMER_1
+#define SERVO_SPEED_MODE    LEDC_LOW_SPEED_MODE
+#define SERVO_RESOLUTION    LEDC_TIMER_14_BIT
+#define SERVO_FREQ_HZ       50
+#define SERVO_DUTY_MIN      410
+#define SERVO_DUTY_MAX      2048
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OLED SSD1306 0.96"
+// ═══════════════════════════════════════════════════════════════════════════════
+#define OLED_I2C_ADDR       0x3C
+#define OLED_H_RES          128
+#define OLED_V_RES          64
+#define OLED_CMD_BITS       8
+#define OLED_PARAM_BITS     8
+static const char *TAG_OLED = "OLED";
+
+static esp_lcd_panel_io_handle_t  oled_io_hdl = NULL;
+static esp_lcd_panel_handle_t     oled_panel_hdl = NULL;
+static uint8_t oled_fb[OLED_H_RES * OLED_V_RES / 8];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAX30102
+// ═══════════════════════════════════════════════════════════════════════════════
+static const char *TAG_MAX = "MAX30102";
+
+#define MAX30102_ADDR       0x57
+#define REG_FIFO_WR_PTR     0x04
+#define REG_OVF_COUNTER     0x05
+#define REG_FIFO_RD_PTR     0x06
+#define REG_FIFO_DATA       0x07
+#define REG_FIFO_CONFIG     0x08
+#define REG_MODE_CONFIG     0x09
+#define REG_SPO2_CONFIG     0x0A
+#define REG_LED1_PA         0x0C
+#define REG_LED2_PA         0x0D
+#define REG_PART_ID         0xFF
+
+#define SAMPLE_RATE         13
+#define WINDOW_SIZE         130
+#define FINGER_THRESH       50000
+#define STABLE_SAMPLES      104
+#define DISCARD_ON_PLACE    26
+#define PI_VALID_MAX        0.18f
+#define PI_VALID_MIN        0.003f
+#define MAX_INVALID         6
+#define MAX_PEAKS           30
+#define MIN_PEAK_DIST       3
+#define MAX_PEAK_DIST       20
+#define PEAK_THRESH_PCT     0.35f
+#define CROSS_MARGIN        0.10f
+#define MIN_VALID_PEAKS     2
+#define IQR_FENCE           1.5f
+#define SPO2_R_MIN          0.40f
+#define SPO2_R_MAX          2.0f
+#define EMA_BPM             0.25f
+#define EMA_SPO2            0.20f
+#define DBG_LEVEL           1
+
+#define BPM_LOW             50
+#define BPM_HIGH            120
+#define SPO2_LOW            93
+
+typedef enum {
+    REJ_NONE = 0, REJ_POCAS_MUESTRAS, REJ_DC_BAJO, REJ_AMPLITUD_BAJA,
+    REJ_PI_FUERA_RANGO, REJ_POCOS_PICOS, REJ_POCOS_VALIDOS,
+    REJ_POCOS_IQR, REJ_BPM_FUERA_RANGO, REJ_SPO2_R_FUERA, REJ_SPO2_BAJO,
+} reject_t;
+
+static const char *rej_str[] = {
+    "ninguno","pocas muestras","DC muy bajo","amplitud<100",
+    "PI fuera de rango","pocos picos","intervalos invalidos",
+    "IQR elimino todo","BPM fuera de 30-220","R fuera de rango","SpO2<80",
+};
+
+static i2c_master_dev_handle_t dev_hdl = NULL;
+
+static uint32_t ir_buf[WINDOW_SIZE];
+static uint32_t red_buf[WINDOW_SIZE];
+static int buf_idx = 0;
+static int buf_count = 0;
+static int clean_samples = 0;
+static int discard_count = 0;
+static bool finger_present = false;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MPU6050
+// ═══════════════════════════════════════════════════════════════════════════════
+static const char *TAG_MPU = "FALL_DETECT";
+
+#define CALIBRATION_MODE    0
+#define CALIB_SAMPLES       200
+#define DEBUG_MODE          1
+
+#define FREEFALL_THRESH     0.80f
+#define FREEFALL_MIN_MS     70
+#define IMPACT_THRESH       2.0f
+#define IMPACT_WINDOW_MS    700
+#define POSTURE_GYRO_THRESH 80.0f
+#define POSTURE_WINDOW_MS   900
+#define POSTURE_ACCEL_Z_MAX 4.50f
+#define FALL_COOLDOWN_MS    6000
+#define JOLT_THRESH         3.20f
+#define EMA_ALPHA           0.3f
+
+typedef enum {
+    STATE_IDLE, STATE_FREEFALL, STATE_IMPACT_WAIT,
+    STATE_POSTURE_CHECK, STATE_FALL_CONFIRMED, STATE_COOLDOWN,
+} fall_state_t;
+
+static float offset_ax=0,offset_ay=0,offset_az=0;
+static float offset_gx=0,offset_gy=0,offset_gz=0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Estado compartido
+// ═══════════════════════════════════════════════════════════════════════════════
+typedef enum {
+    VITAL_NORMAL = 0,
+    VITAL_WARN_BPM,
+    VITAL_WARN_SPO2,
+    VITAL_FALL,
+} alert_level_t;
+
+static volatile alert_level_t g_alert = VITAL_NORMAL;
+static SemaphoreHandle_t g_alert_mutex = NULL;
+
+static volatile int g_bpm_display = 0;
+static volatile int g_spo2_display = 0;
+static volatile bool g_finger_oled = false;
+static volatile fall_state_t g_fall_state_display = STATE_IDLE;
+
+static led_strip_handle_t rgb_strip = NULL;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Servo
+// ═══════════════════════════════════════════════════════════════════════════════
+static void servo_set_angle(int angle_deg)
+{
+    if (angle_deg < 0) angle_deg = 0;
+    if (angle_deg > 180) angle_deg = 180;
+    uint32_t duty = SERVO_DUTY_MIN +
+                    (uint32_t)((angle_deg * (SERVO_DUTY_MAX - SERVO_DUTY_MIN)) / 180);
+    ledc_set_duty(SERVO_SPEED_MODE, SERVO_CHANNEL, duty);
+    ledc_update_duty(SERVO_SPEED_MODE, SERVO_CHANNEL);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Fuente 5x8 OLED
+// ═══════════════════════════════════════════════════════════════════════════════
+static const uint8_t font5x8[][5] = {
+    {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},{0x14,0x7F,0x14,0x7F,0x14},
+    {0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},{0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},
+    {0x00,0x1C,0x22,0x41,0x00},{0x00,0x41,0x22,0x1C,0x00},{0x14,0x08,0x3E,0x08,0x14},{0x08,0x08,0x3E,0x08,0x08},
+    {0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},{0x20,0x10,0x08,0x04,0x02},
+    {0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},{0x00,0x56,0x36,0x00,0x00},
+    {0x08,0x14,0x22,0x41,0x00},{0x14,0x14,0x14,0x14,0x14},{0x00,0x41,0x22,0x14,0x08},{0x02,0x01,0x51,0x09,0x06},
+    {0x32,0x49,0x79,0x41,0x3E},{0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},{0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},{0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},{0x46,0x49,0x49,0x49,0x31},
+    {0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},{0x40,0x40,0x40,0x40,0x40},
+    {0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},
+    {0x38,0x44,0x44,0x48,0x7F},{0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
+    {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},{0x7F,0x10,0x28,0x44,0x00},
+    {0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},
+    {0x7C,0x14,0x14,0x14,0x08},{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x20,0x7C},{0x1C,0x20,0x40,0x20,0x1C},{0x3C,0x40,0x30,0x40,0x3C},
+    {0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},{0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},
+    {0x00,0x00,0x7F,0x00,0x00},{0x00,0x41,0x36,0x08,0x00},{0x10,0x08,0x08,0x10,0x08},
+};
+
+static void oled_fb_char(uint8_t col, uint8_t row, char c)
+{
+    if (c < 32 || c > 126) c = '?';
+    const uint8_t *glyph = font5x8[c - 32];
+    for (int i = 0; i < 5; i++) {
+        int x = col + i;
+        if (x >= OLED_H_RES) break;
+        oled_fb[row * OLED_H_RES + x] = glyph[i];
+    }
+}
+
+static void oled_fb_string(uint8_t col, uint8_t row, const char *s)
+{
+    while (*s) {
+        oled_fb_char(col, row, *s++);
+        col += 6;
+        if (col + 5 >= OLED_H_RES) break;
+    }
+}
+
+static void oled_fb_clear(void)
+{
+    memset(oled_fb, 0, sizeof(oled_fb));
+}
+
+static void oled_flush(void)
+{
+    esp_lcd_panel_draw_bitmap(oled_panel_hdl, 0, 0, OLED_H_RES, OLED_V_RES, oled_fb);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Actuadores
+// ═══════════════════════════════════════════════════════════════════════════════
+static void buzzer_on(uint32_t freq_hz)
+{
+    ledc_set_freq(BUZZER_SPEED_MODE, BUZZER_TIMER, freq_hz);
+    ledc_set_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL, 512);
+    ledc_update_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL);
+}
+static void buzzer_off(void)
+{
+    ledc_set_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL, 0);
+    ledc_update_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL);
+}
+static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    led_strip_set_pixel(rgb_strip, 0, r, g, b);
+    led_strip_refresh(rgb_strip);
+}
+static void rgb_off(void)
+{
+    led_strip_clear(rgb_strip);
+    led_strip_refresh(rgb_strip);
+}
+
+static void actuators_init(void)
+{
+    ledc_timer_config_t tmr_buz = {
+        .speed_mode=BUZZER_SPEED_MODE, .timer_num=BUZZER_TIMER,
+        .duty_resolution=BUZZER_RESOLUTION, .freq_hz=BUZZER_FREQ_ALERT,
+        .clk_cfg=LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&tmr_buz);
+
+    ledc_channel_config_t ch_buz = {
+        .speed_mode=BUZZER_SPEED_MODE, .channel=BUZZER_CHANNEL,
+        .timer_sel=BUZZER_TIMER, .gpio_num=BUZZER_PIN, .duty=0, .hpoint=0,
+    };
+    ledc_channel_config(&ch_buz);
+
+    ledc_timer_config_t tmr_srv = {
+        .speed_mode = SERVO_SPEED_MODE,
+        .timer_num = SERVO_TIMER,
+        .duty_resolution = SERVO_RESOLUTION,
+        .freq_hz = SERVO_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&tmr_srv);
+
+    ledc_channel_config_t ch_srv = {
+        .speed_mode = SERVO_SPEED_MODE,
+        .channel = SERVO_CHANNEL,
+        .timer_sel = SERVO_TIMER,
+        .gpio_num = SERVO_PIN,
+        .duty = SERVO_DUTY_MIN,
+        .hpoint = 0,
+    };
+    ledc_channel_config(&ch_srv);
+    servo_set_angle(0);
+
+    led_strip_config_t sc = {
+        .strip_gpio_num = RGB_LED_PIN,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+    };
+    led_strip_rmt_config_t rc = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&sc, &rc, &rgb_strip));
+
+    rgb_set(0, 40, 0);   // verde inicial
+    buzzer_off();
+}
+
+static void actuators_update(void)
+{
+    alert_level_t lv;
+    xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
+    lv = g_alert;
+    xSemaphoreGive(g_alert_mutex);
+
+    switch (lv) {
+    case VITAL_NORMAL:
+        rgb_set(0, 255, 0);      // verde
+        servo_set_angle(0);
+        break;
+    case VITAL_WARN_BPM:
+        rgb_set(255, 80, 0);     // amarillo/naranja
+        servo_set_angle(45);
+        break;
+    case VITAL_WARN_SPO2:
+        rgb_set(0, 0, 255);      // azul
+        servo_set_angle(90);
+        break;
+    case VITAL_FALL:
+        break;
+    }
+}
+
+static void actuators_fall_alert(void)
+{
+    servo_set_angle(180);
+    for (int i = 0; i < 5; i++) {
+        rgb_set(255, 0, 0);      // rojo
+        buzzer_on(BUZZER_FREQ_ALERT);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        rgb_off();
+        buzzer_off();
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    rgb_set(255, 0, 0);          // rojo fijo
+}
+
+static void actuators_jolt(void)
+{
+    rgb_set(255, 80, 0);         // amarillo/naranja
+    buzzer_on(BUZZER_FREQ_JOLT);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    buzzer_off();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    actuators_update();
+}
+
+static void beep_vital_warn(void)
+{
+    buzzer_on(BUZZER_FREQ_WARN);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_off();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_on(BUZZER_FREQ_WARN);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_off();
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TAREA OLED — refresca pantalla cada 500 ms  ← NUEVO
+// ═══════════════════════════════════════════════════════════════════════════════
+static void task_oled(void *arg)
+{
+    char line[22];
+    static const char *alert_str[] = {
+        "OK  ", "BPM!", "SpO2", "FALL",
+    };
+    static const char *fall_str[] = {
+        "Idle    ", "FreeFall", "ImpWait ", "Posture ", "CAIDA!! ", "Cooldown",
+    };
+
+    ESP_LOGI(TAG_OLED, "Tarea OLED iniciada");
+
+    while (true) {
+        alert_level_t lv;
+        xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
+        lv = g_alert;
+        xSemaphoreGive(g_alert_mutex);
+
+        int bpm   = g_bpm_display;
+        int spo2  = g_spo2_display;
+        bool fing = g_finger_oled;
+        fall_state_t fst = g_fall_state_display;
+
+        oled_fb_clear();
+
+        // Línea 0 (row=0): título
+        oled_fb_string(0, 0, "=Monitor Vital=");
+
+        // Línea 1 (row=1): BPM
+        if (!fing) {
+            snprintf(line, sizeof(line), "BPM: ---");
+        } else if (bpm > 0) {
+            snprintf(line, sizeof(line), "BPM: %3d bpm", bpm);
+        } else {
+            snprintf(line, sizeof(line), "BPM: calcul...");
+        }
+        oled_fb_string(0, 1, line);
+
+        // Línea 2 (row=2): SpO2
+        if (!fing) {
+            snprintf(line, sizeof(line), "SpO2: ---");
+        } else if (spo2 > 0) {
+            snprintf(line, sizeof(line), "SpO2: %2d%%", spo2);
+        } else {
+            snprintf(line, sizeof(line), "SpO2: calcul...");
+        }
+        oled_fb_string(0, 2, line);
+
+        // Línea 3 (row=3): estado detector caída
+        snprintf(line, sizeof(line), "MPU: %s", fall_str[fst < 6 ? fst : 0]);
+        oled_fb_string(0, 3, line);
+
+        // Línea 4 (row=4): nivel de alerta + servo ángulo
+        int servo_ang = 0;
+        switch (lv) {
+            case VITAL_WARN_BPM:  servo_ang = 45;  break;
+            case VITAL_WARN_SPO2: servo_ang = 90;  break;
+            case VITAL_FALL:      servo_ang = 180; break;
+            default:              servo_ang = 0;   break;
+        }
+        snprintf(line, sizeof(line), "Alert:%s Srv:%3d", alert_str[lv], servo_ang);
+        oled_fb_string(0, 4, line);
+
+        // Línea 5 (row=5): dedo
+        oled_fb_string(0, 5, fing ? "Dedo: presente " : "Dedo: ausente  ");
+
+        oled_flush();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAX30102 — helpers I2C (sin cambios)
+// ═══════════════════════════════════════════════════════════════════════════════
+static esp_err_t max_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = {reg, val};
+    return i2c_master_transmit(dev_hdl, buf, 2, pdMS_TO_TICKS(200));
+}
+static esp_err_t max_read_reg(uint8_t reg, uint8_t *out, size_t len)
+{
+    return i2c_master_transmit_receive(dev_hdl, &reg, 1, out, len, pdMS_TO_TICKS(200));
+}
+static void hard_reset(float *bpms, float *spo2s, int *inv)
+{
+    buf_count = buf_idx = clean_samples = 0;
+    discard_count = DISCARD_ON_PLACE;
+    finger_present = false;
+    *bpms = *spo2s = 0.0f; *inv = 0;
+    g_bpm_display = 0; g_spo2_display = 0; g_finger_oled = false;
+    for (int i=0; i<WINDOW_SIZE; i++) ir_buf[i]=red_buf[i]=0;
+}
+static void soft_reset(float *bpms, float *spo2s, int *inv)
+{
+    buf_count = buf_idx = clean_samples = 0;
+    *bpms = *spo2s = 0.0f; *inv = 0;
+    g_bpm_display = 0; g_spo2_display = 0;
+    for (int i=0; i<WINDOW_SIZE; i++) ir_buf[i]=red_buf[i]=0;
+}
+static esp_err_t max30102_init(void)
+{
+    uint8_t part_id = 0;
+    esp_err_t ret = max_read_reg(REG_PART_ID, &part_id, 1);
+    if (ret != ESP_OK || part_id != 0x15) {
+        ESP_LOGE(TAG_MAX, "Part ID error: 0x%02X (esperado 0x15)", part_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG_MAX, "Part ID OK: 0x%02X", part_id);
+    max_write_reg(REG_MODE_CONFIG, 0x40);
+    uint8_t mode=0x40; int t=20;
+    while ((mode & 0x40) && t--) { vTaskDelay(pdMS_TO_TICKS(10)); max_read_reg(REG_MODE_CONFIG,&mode,1); }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    max_write_reg(REG_FIFO_CONFIG, 0x50);
+    max_write_reg(REG_MODE_CONFIG, 0x03);
+    max_write_reg(REG_SPO2_CONFIG, 0x43);
+    max_write_reg(REG_LED1_PA,     0x7F);
+    max_write_reg(REG_LED2_PA,     0x7F);
+    max_write_reg(REG_FIFO_WR_PTR, 0x00);
+    max_write_reg(REG_OVF_COUNTER, 0x00);
+    max_write_reg(REG_FIFO_RD_PTR, 0x00);
+    ESP_LOGI(TAG_MAX, "MAX30102 listo — 50SPS avg4 ~13SPS efectivos");
+    return ESP_OK;
+}
+static esp_err_t max30102_read_fifo(uint32_t *red, uint32_t *ir)
+{
+    uint8_t raw[6];
+    esp_err_t ret = max_read_reg(REG_FIFO_DATA, raw, 6);
+    if (ret != ESP_OK) return ret;
+    *red = ((uint32_t)(raw[0]&0x03)<<16)|((uint32_t)raw[1]<<8)|raw[2];
+    *ir  = ((uint32_t)(raw[3]&0x03)<<16)|((uint32_t)raw[4]<<8)|raw[5];
+    return ESP_OK;
+}
+static void linearize_buffer(uint32_t *ir_out, uint32_t *red_out, int count)
+{
+    int start = (count < WINDOW_SIZE) ? 0 : buf_idx;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % WINDOW_SIZE;
+        ir_out[i]  = ir_buf[idx];
+        red_out[i] = red_buf[idx];
+    }
+}
+static void median3_filter(uint32_t *in, float *out, int count)
+{
+    out[0] = (float)in[0];
+    if (count < 2) return;
+    out[count - 1] = (float)in[count - 1];
+    for (int i = 1; i < count - 1; i++) {
+        float a = (float)in[i - 1], b = (float)in[i], c = (float)in[i + 1];
+        float t;
+        if (a > b) { t = a; a = b; b = t; }
+        if (b > c) { t = b; b = c; c = t; }
+        if (a > b) { t = a; a = b; b = t; }
+        out[i] = b;
+    }
+}
+static void sort_float(float *arr, int n)
+{
+    for (int i=1;i<n;i++){float key=arr[i];int j=i-1;while(j>=0&&arr[j]>key){arr[j+1]=arr[j];j--;}arr[j+1]=key;}
+}
+static int calc_bpm(uint32_t *ir, int count, float *pi_out,
+                    int *dbg_peaks,int *dbg_valid,int *dbg_used,
+                    float *dbg_meaniv,float *dbg_dc,float *dbg_amp, reject_t *reason)
+{
+    *pi_out = 0;
+    *dbg_peaks = *dbg_valid = *dbg_used = 0;
+    *dbg_meaniv = *dbg_dc = *dbg_amp = 0;
+    *reason = REJ_NONE;
+
+    if (count < STABLE_SAMPLES) {
+        *reason = REJ_POCAS_MUESTRAS;
+        return 0;
+    }
+
+    static float irf[WINDOW_SIZE];
+    median3_filter(ir, irf, count);
+
+    float dc = 0;
+    for (int i = 0; i < count; i++) dc += irf[i];
+    dc /= count;
+    *dbg_dc = dc;
+
+    if (dc < 1.0f) {
+        *reason = REJ_DC_BAJO;
+        return 0;
+    }
+
+    float acmin = 1e9f, acmax = -1e9f;
+    for (int i = 0; i < count; i++) {
+        float v = irf[i] - dc;
+        if (v < acmin) acmin = v;
+        if (v > acmax) acmax = v;
+    }
+
+    float amplitude = acmax - acmin;
+    *dbg_amp = amplitude;
+    if (amplitude < 100.f) {
+        *reason = REJ_AMPLITUD_BAJA;
+        return 0;
+    }
+
+    float pi = amplitude / dc;
+    *pi_out = pi;
+    if (pi < PI_VALID_MIN || pi > PI_VALID_MAX) {
+        *reason = REJ_PI_FUERA_RANGO;
+        return 0;
+    }
+
+    float threshold = acmin + amplitude * PEAK_THRESH_PCT;
+    float crosslevel = -amplitude * CROSS_MARGIN;
+
+    static int peak_idx[MAX_PEAKS];
+    int npeaks = 0;
+    bool above = false;
+    float peak_val = -1e9f;
+    int peak_pos = -1;
+
+    for (int i = 0; i < count; i++) {
+        float v = irf[i] - dc;
+        if (!above && v > threshold) {
+            above = true;
+            peak_val = v;
+            peak_pos = i;
+        } else if (above && v > peak_val) {
+            peak_val = v;
+            peak_pos = i;
+        } else if (above && v < crosslevel) {
+            int last = npeaks > 0 ? peak_idx[npeaks - 1] : -MIN_PEAK_DIST - 1;
+            if (peak_pos - last >= MIN_PEAK_DIST && npeaks < MAX_PEAKS) {
+                peak_idx[npeaks++] = peak_pos;
+            }
+            above = false;
+            peak_val = -1e9f;
+        }
+    }
+
+    *dbg_peaks = npeaks;
+    if (npeaks < MIN_VALID_PEAKS + 1) {
+        *reason = REJ_POCOS_PICOS;
+        return 0;
+    }
+
+    int nintervals = npeaks - 1;
+    static float intervals[MAX_PEAKS];
+    for (int i = 0; i < nintervals; i++) {
+        int dist = peak_idx[i + 1] - peak_idx[i];
+        intervals[i] = (dist >= MIN_PEAK_DIST && dist <= MAX_PEAK_DIST) ? (float)dist / SAMPLE_RATE : -1.f;
+    }
+
+    static float validivs[MAX_PEAKS], sortedivs[MAX_PEAKS];
+    int nvalid = 0;
+    for (int i = 0; i < nintervals; i++) {
+        if (intervals[i] > 0) validivs[nvalid++] = intervals[i];
+    }
+
+    *dbg_valid = nvalid;
+    if (nvalid < MIN_VALID_PEAKS) {
+        *reason = REJ_POCOS_VALIDOS;
+        return 0;
+    }
+
+    for (int i = 0; i < nvalid; i++) sortedivs[i] = validivs[i];
+    sort_float(sortedivs, nvalid);
+
+    float q1 = sortedivs[nvalid / 4];
+    float q3 = sortedivs[nvalid * 3 / 4];
+    float iqr = q3 - q1, lo = q1 - IQR_FENCE * iqr, hi = q3 + IQR_FENCE * iqr;
+
+    float sum = 0;
+    int used = 0;
+    for (int i = 0; i < nvalid; i++) {
+        if (validivs[i] >= lo && validivs[i] <= hi) {
+            sum += validivs[i];
+            used++;
+        }
+    }
+
+    *dbg_used = used;
+    if (used < MIN_VALID_PEAKS) {
+        *reason = REJ_POCOS_IQR;
+        return 0;
+    }
+
+    float meaniv = sum / used;
+    *dbg_meaniv = meaniv;
+    int bpm = (int)roundf(60.f / meaniv);
+
+    if (bpm < 30 || bpm > 220) {
+        *reason = REJ_BPM_FUERA_RANGO;
+        return 0;
+    }
+    return bpm;
+
+}
+static int calc_spo2(uint32_t *red, uint32_t *ir, int count, float pi,
+                     float *dbg_R, reject_t *reason)
+{
+    *dbg_R = 0;
+    *reason = REJ_NONE;
+
+    if (count < STABLE_SAMPLES || pi < PI_VALID_MIN || pi > PI_VALID_MAX) {
+        *reason = REJ_PI_FUERA_RANGO;
+        return 0;
+    }
+
+    static float redf[WINDOW_SIZE], irf[WINDOW_SIZE];
+    median3_filter(red, redf, count);
+    median3_filter(ir, irf, count);
+
+    float reddc = 0, irdc = 0;
+    for (int i = 0; i < count; i++) {
+        reddc += redf[i];
+        irdc += irf[i];
+    }
+    reddc /= count;
+    irdc /= count;
+
+    if (reddc < 1.f || irdc < 1.f) {
+        *reason = REJ_DC_BAJO;
+        return 0;
+    }
+
+    float rr = 0, ss = 0;
+    for (int i = 0; i < count; i++) {
+        float r = redf[i] - reddc, s = irf[i] - irdc;
+        rr += r * r;
+        ss += s * s;
+    }
+
+    float redrms = sqrtf(rr / count), irrms = sqrtf(ss / count);
+    if (irrms < 1.f || redrms < 1.f) {
+        *reason = REJ_AMPLITUD_BAJA;
+        return 0;
+    }
+
+    float R = (redrms / reddc) / (irrms / irdc);
+    *dbg_R = R;
+    if (R < SPO2_R_MIN || R > SPO2_R_MAX) {
+        *reason = REJ_SPO2_R_FUERA;
+        return 0;
+    }
+
+    float spo2 = -45.060f * R * R + 30.354f * R + 94.845f;
+    if (spo2 > 100.f) spo2 = 100.f;
+    if (spo2 < 80.f) {
+        *reason = REJ_SPO2_BAJO;
+        return 0;
+    }
+
+    return (int)roundf(spo2);
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TAREA MAX30102 (se agregan escrituras a g_bpm_display / g_spo2_display)
+// ═══════════════════════════════════════════════════════════════════════════════
+static void task_max30102(void *arg)
+{
+    float bpm_smooth=0.f, spo2_smooth=0.f;
+    int inv_count=0;
+    TickType_t last_report = xTaskGetTickCount();
+    uint32_t ir_lin[WINDOW_SIZE], red_lin[WINDOW_SIZE];
+
+    while (true) {
+        xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
+        bool falling = (g_alert == VITAL_FALL);
+        xSemaphoreGive(g_alert_mutex);
+        if (falling) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        uint8_t wr=0,rd=0,ovf=0;
+        max_read_reg(REG_FIFO_WR_PTR,&wr,1);
+        max_read_reg(REG_FIFO_RD_PTR,&rd,1);
+        max_read_reg(REG_OVF_COUNTER,&ovf,1);
+        if (ovf) max_write_reg(REG_OVF_COUNTER,0x00);
+
+        uint8_t ns = (wr-rd) & 0x1F;
+        for (uint8_t i=0; i<ns; i++) {
+            uint32_t red=0,ir=0;
+            if (max30102_read_fifo(&red,&ir) != ESP_OK) continue;
+            if (ir < FINGER_THRESH) {
+                if (finger_present) {
+                    ESP_LOGI(TAG_MAX,"Dedo retirado — reiniciando...");
+                    hard_reset(&bpm_smooth,&spo2_smooth,&inv_count);
+                    xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+                    if (g_alert == VITAL_WARN_BPM || g_alert == VITAL_WARN_SPO2)
+                        g_alert = VITAL_NORMAL;
+                    xSemaphoreGive(g_alert_mutex);
+                    actuators_update();
+                }
+                continue;
+            }
+            if (!finger_present) {
+                hard_reset(&bpm_smooth,&spo2_smooth,&inv_count);
+                finger_present = true;
+                g_finger_oled = true;   // ← OLED
+                ESP_LOGI(TAG_MAX,"Dedo detectado — descartando %d muestras transitorio...",DISCARD_ON_PLACE);
+            }
+            if (discard_count > 0) { discard_count--; continue; }
+            ir_buf[buf_idx]  = ir;
+            red_buf[buf_idx] = red;
+            buf_idx = (buf_idx+1) % WINDOW_SIZE;
+            if (buf_count < WINDOW_SIZE) buf_count++;
+            if (clean_samples < WINDOW_SIZE) clean_samples++;
+        }
+
+        if ((xTaskGetTickCount()-last_report) < pdMS_TO_TICKS(2000)) {
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        last_report = xTaskGetTickCount();
+
+        if (!finger_present || buf_count == 0) {
+            ESP_LOGI(TAG_MAX,"Pon el dedo sobre el sensor...");
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        if (clean_samples < STABLE_SAMPLES) {
+            ESP_LOGI(TAG_MAX,"Estabilizando... %d/%d — no muevas el dedo",clean_samples,STABLE_SAMPLES);
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+
+        linearize_buffer(ir_lin,red_lin,buf_count);
+        float pi=0,dbg_dc=0,dbg_amp=0,dbg_meaniv=0,dbg_R=0;
+        int dbg_peaks=0,dbg_valid=0,dbg_used=0;
+        reject_t rej_bpm=REJ_NONE,rej_spo2=REJ_NONE;
+        int bpm  = calc_bpm (ir_lin,buf_count,&pi,&dbg_peaks,&dbg_valid,&dbg_used,&dbg_meaniv,&dbg_dc,&dbg_amp,&rej_bpm);
+        int spo2 = calc_spo2(red_lin,ir_lin,buf_count,pi,&dbg_R,&rej_spo2);
+
+#if DBG_LEVEL >= 1
+        if (!bpm) ESP_LOGW(TAG_MAX,"BPM rechazado: %s | picos=%d valid=%d used=%d pi=%.4f amp=%.0f",rej_str[rej_bpm],dbg_peaks,dbg_valid,dbg_used,pi,dbg_amp);
+        if (!spo2 && rej_spo2!=REJ_PI_FUERA_RANGO) ESP_LOGW(TAG_MAX,"SpO2 rechazado: %s | R=%.4f",rej_str[rej_spo2],dbg_R);
+#endif
+
+        alert_level_t new_alert = VITAL_NORMAL;
+
+        if (bpm > 0) {
+            inv_count = 0;
+            bpm_smooth = (bpm_smooth==0.f) ? (float)bpm : EMA_BPM*(float)bpm+(1.f-EMA_BPM)*bpm_smooth;
+            if (spo2 > 0) spo2_smooth = (spo2_smooth==0.f) ? (float)spo2 : EMA_SPO2*(float)spo2+(1.f-EMA_SPO2)*spo2_smooth;
+
+            int bpm_r  = (int)roundf(bpm_smooth);
+            int spo2_r = (spo2_smooth>0.f) ? (int)roundf(spo2_smooth) : 0;
+
+            // Actualizar OLED  ← NUEVO
+            g_bpm_display  = bpm_r;
+            g_spo2_display = spo2_r;
+
+            if (spo2_r > 0 && spo2_r < SPO2_LOW) {
+                new_alert = VITAL_WARN_SPO2;
+                ESP_LOGW(TAG_MAX,"⚠ SpO2 BAJO: %d%%  BPM: %d", spo2_r, bpm_r);
+            } else if (bpm_r < BPM_LOW || bpm_r > BPM_HIGH) {
+                new_alert = VITAL_WARN_BPM;
+                ESP_LOGW(TAG_MAX,"⚠ BPM ANORMAL: %d  SpO2: %s", bpm_r, spo2_r>0?"--":"%d");
+            }
+
+            if (spo2_r > 0)
+                ESP_LOGI(TAG_MAX,"BPM: %3d  SpO2: %2d%%  PI: %.4f", bpm_r, spo2_r, pi);
+            else
+                ESP_LOGI(TAG_MAX,"BPM: %3d  SpO2: ---   PI: %.4f", bpm_r, pi);
+
+        } else {
+            inv_count++;
+            if (bpm_smooth > 0.f && inv_count < MAX_INVALID) {
+                ESP_LOGI(TAG_MAX,"BPM: %3d  SpO2: %s  PI: %.4f [senal debil %d/%d]",
+                    (int)roundf(bpm_smooth),
+                    spo2_smooth>0.f ? "ok" : "---", pi, inv_count, MAX_INVALID);
+            } else {
+                soft_reset(&bpm_smooth,&spo2_smooth,&inv_count);
+                finger_present = true;
+                g_finger_oled = true;
+                ESP_LOGW(TAG_MAX,"Recalibrando — manten el dedo quieto %ds",STABLE_SAMPLES/SAMPLE_RATE);
+            }
+        }
+
+        xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+        if (g_alert != VITAL_FALL) {
+            bool changed = (g_alert != new_alert);
+            g_alert = new_alert;
+            xSemaphoreGive(g_alert_mutex);
+            if (changed) {
+                actuators_update();
+                if (new_alert == VITAL_WARN_BPM || new_alert == VITAL_WARN_SPO2)
+                    beep_vital_warn();
+            }
+        } else {
+            xSemaphoreGive(g_alert_mutex);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TAREA MPU6050 (se agrega escritura a g_fall_state_display)
+// ═══════════════════════════════════════════════════════════════════════════════
+static void calibrate_mpu(mpu6050_handle_t mpu)
+{
+    ESP_LOGI(TAG_MPU,"=== CALIBRACION: sensor QUIETO y PLANO. Iniciando en 3s... ===");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    double sax=0,say=0,saz=0,sgx=0,sgy=0,sgz=0;
+    mpu6050_gyro_data_axes_t gyro; mpu6050_accel_data_axes_t accel; float temp=0;
+    for(int i=0;i<CALIB_SAMPLES;i++){
+        ESP_ERROR_CHECK(mpu6050_get_motion(mpu,&gyro,&accel,&temp));
+        sax+=accel.x_axis;say+=accel.y_axis;saz+=accel.z_axis;
+        sgx+=gyro.x_axis;sgy+=gyro.y_axis;sgz+=gyro.z_axis;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG_MPU,"┌─ REFERENCIA ─────────────────────────────────────────────");
+    ESP_LOGI(TAG_MPU,"│  ax=%.5f ay=%.5f az=%.5f",(float)(sax/CALIB_SAMPLES),(float)(say/CALIB_SAMPLES),(float)(saz/CALIB_SAMPLES)-1.f);
+    ESP_LOGI(TAG_MPU,"│  gx=%.5f gy=%.5f gz=%.5f",(float)(sgx/CALIB_SAMPLES),(float)(sgy/CALIB_SAMPLES),(float)(sgz/CALIB_SAMPLES));
+    ESP_LOGI(TAG_MPU,"└───────────────────────────────────────────────────────────");
+}
+
+static void task_mpu6050(void *arg)
+{
+    mpu6050_handle_t mpu = (mpu6050_handle_t)arg;
+
+    fall_state_t state = STATE_IDLE;
+    TickType_t phase_start = xTaskGetTickCount();
+    float ema_mag=1.f, ema_gyr=0.f;
+    uint32_t last_idle_print=0;
+
+    ESP_LOGI(TAG_MPU,"");
+    ESP_LOGI(TAG_MPU,"╔══════════════════════════════════════════════╗");
+    ESP_LOGI(TAG_MPU,"║   DETECCION DE CAIDAS ACTIVA — 50Hz          ║");
+    ESP_LOGI(TAG_MPU,"╚══════════════════════════════════════════════╝");
+
+    mpu6050_gyro_data_axes_t gyro; mpu6050_accel_data_axes_t accel; float temp=0;
+
+    while (true) {
+        if (mpu6050_get_motion(mpu,&gyro,&accel,&temp) != ESP_OK){
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        float ax=accel.x_axis-offset_ax, ay=accel.y_axis-offset_ay, az=accel.z_axis-offset_az;
+        float gx=gyro.x_axis-offset_gx,  gy=gyro.y_axis-offset_gy,  gz=gyro.z_axis-offset_gz;
+        float raw_mag  = sqrtf(ax*ax+ay*ay+az*az);
+        float raw_gmag = sqrtf(gx*gx+gy*gy+gz*gz);
+        ema_mag = EMA_ALPHA*raw_mag  + (1.f-EMA_ALPHA)*ema_mag;
+        ema_gyr = EMA_ALPHA*raw_gmag + (1.f-EMA_ALPHA)*ema_gyr;
+
+        TickType_t now = xTaskGetTickCount();
+        uint32_t elapsed_ms = (uint32_t)((now-phase_start)*portTICK_PERIOD_MS);
+
+        g_fall_state_display = state;   // ← OLED
+
+#if DEBUG_MODE
+        if(state==STATE_IDLE&&(elapsed_ms-last_idle_print)>=2000){
+            last_idle_print=elapsed_ms;
+            ESP_LOGI(TAG_MPU,"[IDLE] ema=%.3fg gyr=%.1fdeg/s az=%.3fg",ema_mag,ema_gyr,az);
+        }
+        if(state==STATE_FREEFALL)
+            ESP_LOGI(TAG_MPU,"  [FF]   ema=%.3fg elapsed=%lums/%dms",ema_mag,(unsigned long)elapsed_ms,FREEFALL_MIN_MS);
+        if(state==STATE_IMPACT_WAIT)
+            ESP_LOGI(TAG_MPU,"  [IMP]  raw=%.3fg elapsed=%lums/%dms",raw_mag,(unsigned long)elapsed_ms,IMPACT_WINDOW_MS);
+        if(state==STATE_POSTURE_CHECK)
+            ESP_LOGI(TAG_MPU,"  [POST] gyr=%.1fdeg/s az=%.3fg elapsed=%lums/%dms",ema_gyr,az,(unsigned long)elapsed_ms,POSTURE_WINDOW_MS);
+#endif
+
+        switch(state){
+        case STATE_IDLE:
+            last_idle_print=elapsed_ms;
+            if(ema_mag<FREEFALL_THRESH){
+                state=STATE_FREEFALL; phase_start=now;
+                ESP_LOGI(TAG_MPU,">> [FASE 1] Free-fall? ema=%.3fg",ema_mag);
+            } else if(raw_mag>JOLT_THRESH){
+                ESP_LOGW(TAG_MPU,"Movimiento brusco |a|=%.2fg",raw_mag);
+                actuators_jolt();
+            }
+            break;
+
+        case STATE_FREEFALL:
+            if(ema_mag>=FREEFALL_THRESH){
+                ESP_LOGI(TAG_MPU,"  [FF] Cancelado en %lums",(unsigned long)elapsed_ms);
+                state=STATE_IDLE; phase_start=now;
+            } else if(elapsed_ms>=FREEFALL_MIN_MS){
+                state=STATE_IMPACT_WAIT; phase_start=now;
+                ESP_LOGI(TAG_MPU,"✓ [FASE 1 OK] Free-fall %lums — esperando impacto...",(unsigned long)elapsed_ms);
+            }
+            break;
+
+        case STATE_IMPACT_WAIT:
+            if(raw_mag>IMPACT_THRESH){
+                state=STATE_POSTURE_CHECK; phase_start=now;
+                rgb_set(255,80,0);
+                ESP_LOGI(TAG_MPU,"✓ [FASE 2 OK] Impacto %.2fg — verificando postura...",raw_mag);
+            } else if(elapsed_ms>IMPACT_WINDOW_MS){
+                ESP_LOGI(TAG_MPU,"  [IMP] Sin impacto en %dms → descartado",IMPACT_WINDOW_MS);
+                state=STATE_IDLE; phase_start=now;
+            }
+            break;
+
+        case STATE_POSTURE_CHECK:
+            if(elapsed_ms>=POSTURE_WINDOW_MS){
+                bool quieto=(ema_gyr<POSTURE_GYRO_THRESH);
+                bool tumbado=true;
+                ESP_LOGI(TAG_MPU,"✓ [FASE 3] gyr=%.1f quieto=%d az=%.3f tumbado=%d",ema_gyr,(int)quieto,az,(int)tumbado);
+                if(quieto&&tumbado){
+                    state=STATE_FALL_CONFIRMED;
+                } else {
+                    ESP_LOGI(TAG_MPU,"  [POST] Giroscopio activo → descartado");
+                    rgb_set(0, 255, 0);
+                    state=STATE_IDLE; phase_start=now;
+                }
+            }
+            break;
+
+        case STATE_FALL_CONFIRMED:
+            xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+            g_alert=VITAL_FALL;
+            xSemaphoreGive(g_alert_mutex);
+            ESP_LOGW(TAG_MPU,"╔══════════════════════════════╗");
+            ESP_LOGW(TAG_MPU,"║   !!! CAIDA CONFIRMADA !!!   ║");
+            ESP_LOGW(TAG_MPU,"╚══════════════════════════════╝");
+            actuators_fall_alert();   // servo ya va a 180° aquí
+            state=STATE_COOLDOWN;
+            phase_start=xTaskGetTickCount();
+            break;
+
+        case STATE_COOLDOWN:
+            if(elapsed_ms>=FALL_COOLDOWN_MS){
+                ESP_LOGI(TAG_MPU,"Cooldown terminado → volviendo a monitoreo");
+                xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+                g_alert=VITAL_NORMAL;
+                xSemaphoreGive(g_alert_mutex);
+                actuators_update();   // servo vuelve a 0°
+                state=STATE_IDLE;
+                phase_start=xTaskGetTickCount();
+            }
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  APP MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
+void app_main(void)
+{
+    // Mutex compartido
+    g_alert_mutex = xSemaphoreCreateMutex();
+    configASSERT(g_alert_mutex);
+
+    // Bus I2C compartido (MAX30102 + MPU6050 + SSD1306)
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port=I2C_MASTER_PORT, .sda_io_num=I2C_MASTER_SDA_IO,
+        .scl_io_num=I2C_MASTER_SCL_IO, .clk_source=I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt=7, .flags.enable_internal_pullup=true,
+    };
+    i2c_master_bus_handle_t i2c_bus=NULL;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg,&i2c_bus));
+
+    // MAX30102
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length=I2C_ADDR_BIT_LEN_7,
+        .device_address=MAX30102_ADDR,
+        .scl_speed_hz=I2C_SPEED_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus,&dev_cfg,&dev_hdl));
+    if (max30102_init() != ESP_OK) {
+        ESP_LOGE(TAG_MAX,"Init fallida. Revisa el cableado."); return;
+    }
+
+    // MPU6050
+    mpu6050_config_t mpu_cfg = I2C_MPU6050_CONFIG_DEFAULT;
+    mpu_cfg.i2c_clock_speed=I2C_SPEED_HZ;
+    mpu_cfg.gyro_full_scale_range=MPU6050_GYRO_FS_RANGE_500DPS;
+    mpu_cfg.accel_full_scale_range=MPU6050_ACCEL_FS_RANGE_4G;
+    mpu_cfg.irq_io_num=GPIO_NUM_NC;
+    mpu6050_handle_t mpu=NULL;
+    ESP_ERROR_CHECK(mpu6050_init(i2c_bus,&mpu_cfg,&mpu));
+    ESP_ERROR_CHECK(mpu6050_reset(mpu));
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    mpu6050_who_am_i_register_t whoami;
+    ESP_ERROR_CHECK(mpu6050_get_who_am_i_register(mpu,&whoami));
+    ESP_LOGI(TAG_MPU,"MPU6050 OK — WHOAMI: 0x%02X",whoami.bits.who_am_i);
+
+    // ── OLED SSD1306 via esp_lcd  ← NUEVO ────────────────────────────────────
+    esp_lcd_panel_io_i2c_config_t io_cfg = {
+        .dev_addr = OLED_I2C_ADDR,
+        .scl_speed_hz = 100000,
+        .control_phase_bytes = 1,
+        .dc_bit_offset = 6,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .flags = {
+            .disable_control_phase = 0,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus, &io_cfg, &oled_io_hdl));
+
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .bits_per_pixel = 1,
+        .reset_gpio_num = GPIO_NUM_NC,
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(oled_io_hdl, &panel_cfg, &oled_panel_hdl));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(oled_panel_hdl));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(oled_panel_hdl));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(oled_panel_hdl, true));
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Actuadores (buzzer, servo, RGB, LED verde)
+    actuators_init();
+
+    // Secuencia arranque: verde → amarillo → rojo + 2 beeps + servo sweep
+    ESP_LOGI("BOOT","Prueba de actuadores...");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    rgb_set(255,80,0);
+    servo_set_angle(45);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    rgb_set(255,0,0); servo_set_angle(90);
+    buzzer_on(BUZZER_FREQ_ALERT);
+    vTaskDelay(pdMS_TO_TICKS(400)); buzzer_off();
+    servo_set_angle(180);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_on(BUZZER_FREQ_ALERT);
+    vTaskDelay(pdMS_TO_TICKS(400)); buzzer_off();
+    servo_set_angle(0);   // vuelve a reposo
+    actuators_update();
+    ESP_LOGI("BOOT","Actuadores OK");
+
+    // OLED boot OK
+    oled_fb_clear();
+    oled_fb_string(0, 0, "=Monitor Vital=");
+    oled_fb_string(0, 2, "Boot OK!");
+    oled_flush();
+
+    // Calibración MPU
+    calibrate_mpu(mpu);
+
+    // Lanzar tareas
+    xTaskCreate(task_max30102, "max30102", 4096, NULL,      5, NULL);
+    xTaskCreate(task_mpu6050,  "mpu6050",  4096, (void*)mpu, 6, NULL);
+    xTaskCreate(task_oled,     "oled",     3072, NULL,      4, NULL);
+    // Prioridades: mpu6050(6) > max30102(5) > oled(4)
+}#include <stdio.h>
+#include <math.h>
+#include <stdbool.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "led_strip.h"
+#include "esp_log.h"
+#include "mpu6050.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PINES
+// ═══════════════════════════════════════════════════════════════════════════════
+#define I2C_MASTER_SDA_IO   GPIO_NUM_8
+#define I2C_MASTER_SCL_IO   GPIO_NUM_9
+#define I2C_MASTER_PORT     I2C_NUM_0
+#define I2C_SPEED_HZ        400000
+
+#define RGB_LED_PIN         GPIO_NUM_48
+#define BUZZER_PIN          GPIO_NUM_7
+#define SERVO_PIN           GPIO_NUM_10
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEDC — buzzer pasivo
+// ═══════════════════════════════════════════════════════════════════════════════
+#define BUZZER_CHANNEL      LEDC_CHANNEL_0
+#define BUZZER_TIMER        LEDC_TIMER_0
+#define BUZZER_SPEED_MODE   LEDC_LOW_SPEED_MODE
+#define BUZZER_RESOLUTION   LEDC_TIMER_10_BIT
+#define BUZZER_FREQ_ALERT   3000
+#define BUZZER_FREQ_JOLT    1500
+#define BUZZER_FREQ_WARN    2000
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEDC — servo SG90
+// ═══════════════════════════════════════════════════════════════════════════════
+#define SERVO_CHANNEL       LEDC_CHANNEL_1
+#define SERVO_TIMER         LEDC_TIMER_1
+#define SERVO_SPEED_MODE    LEDC_LOW_SPEED_MODE
+#define SERVO_RESOLUTION    LEDC_TIMER_14_BIT
+#define SERVO_FREQ_HZ       50
+#define SERVO_DUTY_MIN      410
+#define SERVO_DUTY_MAX      2048
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OLED SSD1306 0.96"
+// ═══════════════════════════════════════════════════════════════════════════════
+#define OLED_I2C_ADDR       0x3C
+#define OLED_H_RES          128
+#define OLED_V_RES          64
+#define OLED_CMD_BITS       8
+#define OLED_PARAM_BITS     8
+static const char *TAG_OLED = "OLED";
+
+static esp_lcd_panel_io_handle_t  oled_io_hdl = NULL;
+static esp_lcd_panel_handle_t     oled_panel_hdl = NULL;
+static uint8_t oled_fb[OLED_H_RES * OLED_V_RES / 8];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAX30102
+// ═══════════════════════════════════════════════════════════════════════════════
+static const char *TAG_MAX = "MAX30102";
+
+#define MAX30102_ADDR       0x57
+#define REG_FIFO_WR_PTR     0x04
+#define REG_OVF_COUNTER     0x05
+#define REG_FIFO_RD_PTR     0x06
+#define REG_FIFO_DATA       0x07
+#define REG_FIFO_CONFIG     0x08
+#define REG_MODE_CONFIG     0x09
+#define REG_SPO2_CONFIG     0x0A
+#define REG_LED1_PA         0x0C
+#define REG_LED2_PA         0x0D
+#define REG_PART_ID         0xFF
+
+#define SAMPLE_RATE         13
+#define WINDOW_SIZE         130
+#define FINGER_THRESH       50000
+#define STABLE_SAMPLES      104
+#define DISCARD_ON_PLACE    26
+#define PI_VALID_MAX        0.18f
+#define PI_VALID_MIN        0.003f
+#define MAX_INVALID         6
+#define MAX_PEAKS           30
+#define MIN_PEAK_DIST       3
+#define MAX_PEAK_DIST       20
+#define PEAK_THRESH_PCT     0.35f
+#define CROSS_MARGIN        0.10f
+#define MIN_VALID_PEAKS     2
+#define IQR_FENCE           1.5f
+#define SPO2_R_MIN          0.40f
+#define SPO2_R_MAX          2.0f
+#define EMA_BPM             0.25f
+#define EMA_SPO2            0.20f
+#define DBG_LEVEL           1
+
+#define BPM_LOW             50
+#define BPM_HIGH            120
+#define SPO2_LOW            93
+
+typedef enum {
+    REJ_NONE = 0, REJ_POCAS_MUESTRAS, REJ_DC_BAJO, REJ_AMPLITUD_BAJA,
+    REJ_PI_FUERA_RANGO, REJ_POCOS_PICOS, REJ_POCOS_VALIDOS,
+    REJ_POCOS_IQR, REJ_BPM_FUERA_RANGO, REJ_SPO2_R_FUERA, REJ_SPO2_BAJO,
+} reject_t;
+
+static const char *rej_str[] = {
+    "ninguno","pocas muestras","DC muy bajo","amplitud<100",
+    "PI fuera de rango","pocos picos","intervalos invalidos",
+    "IQR elimino todo","BPM fuera de 30-220","R fuera de rango","SpO2<80",
+};
+
+static i2c_master_dev_handle_t dev_hdl = NULL;
+
+static uint32_t ir_buf[WINDOW_SIZE];
+static uint32_t red_buf[WINDOW_SIZE];
+static int buf_idx = 0;
+static int buf_count = 0;
+static int clean_samples = 0;
+static int discard_count = 0;
+static bool finger_present = false;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MPU6050
+// ═══════════════════════════════════════════════════════════════════════════════
+static const char *TAG_MPU = "FALL_DETECT";
+
+#define CALIBRATION_MODE    0
+#define CALIB_SAMPLES       200
+#define DEBUG_MODE          1
+
+#define FREEFALL_THRESH     0.80f
+#define FREEFALL_MIN_MS     70
+#define IMPACT_THRESH       2.0f
+#define IMPACT_WINDOW_MS    700
+#define POSTURE_GYRO_THRESH 80.0f
+#define POSTURE_WINDOW_MS   900
+#define POSTURE_ACCEL_Z_MAX 4.50f
+#define FALL_COOLDOWN_MS    6000
+#define JOLT_THRESH         3.20f
+#define EMA_ALPHA           0.3f
+
+typedef enum {
+    STATE_IDLE, STATE_FREEFALL, STATE_IMPACT_WAIT,
+    STATE_POSTURE_CHECK, STATE_FALL_CONFIRMED, STATE_COOLDOWN,
+} fall_state_t;
+
+static float offset_ax=0,offset_ay=0,offset_az=0;
+static float offset_gx=0,offset_gy=0,offset_gz=0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Estado compartido
+// ═══════════════════════════════════════════════════════════════════════════════
+typedef enum {
+    VITAL_NORMAL = 0,
+    VITAL_WARN_BPM,
+    VITAL_WARN_SPO2,
+    VITAL_FALL,
+} alert_level_t;
+
+static volatile alert_level_t g_alert = VITAL_NORMAL;
+static SemaphoreHandle_t g_alert_mutex = NULL;
+
+static volatile int g_bpm_display = 0;
+static volatile int g_spo2_display = 0;
+static volatile bool g_finger_oled = false;
+static volatile fall_state_t g_fall_state_display = STATE_IDLE;
+
+static led_strip_handle_t rgb_strip = NULL;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Servo
+// ═══════════════════════════════════════════════════════════════════════════════
+static void servo_set_angle(int angle_deg)
+{
+    if (angle_deg < 0) angle_deg = 0;
+    if (angle_deg > 180) angle_deg = 180;
+    uint32_t duty = SERVO_DUTY_MIN +
+                    (uint32_t)((angle_deg * (SERVO_DUTY_MAX - SERVO_DUTY_MIN)) / 180);
+    ledc_set_duty(SERVO_SPEED_MODE, SERVO_CHANNEL, duty);
+    ledc_update_duty(SERVO_SPEED_MODE, SERVO_CHANNEL);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Fuente 5x8 OLED
+// ═══════════════════════════════════════════════════════════════════════════════
+static const uint8_t font5x8[][5] = {
+    {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},{0x14,0x7F,0x14,0x7F,0x14},
+    {0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},{0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},
+    {0x00,0x1C,0x22,0x41,0x00},{0x00,0x41,0x22,0x1C,0x00},{0x14,0x08,0x3E,0x08,0x14},{0x08,0x08,0x3E,0x08,0x08},
+    {0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},{0x20,0x10,0x08,0x04,0x02},
+    {0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},{0x00,0x56,0x36,0x00,0x00},
+    {0x08,0x14,0x22,0x41,0x00},{0x14,0x14,0x14,0x14,0x14},{0x00,0x41,0x22,0x14,0x08},{0x02,0x01,0x51,0x09,0x06},
+    {0x32,0x49,0x79,0x41,0x3E},{0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},{0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},{0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},{0x46,0x49,0x49,0x49,0x31},
+    {0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},{0x40,0x40,0x40,0x40,0x40},
+    {0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},
+    {0x38,0x44,0x44,0x48,0x7F},{0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
+    {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},{0x7F,0x10,0x28,0x44,0x00},
+    {0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},
+    {0x7C,0x14,0x14,0x14,0x08},{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x20,0x7C},{0x1C,0x20,0x40,0x20,0x1C},{0x3C,0x40,0x30,0x40,0x3C},
+    {0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},{0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},
+    {0x00,0x00,0x7F,0x00,0x00},{0x00,0x41,0x36,0x08,0x00},{0x10,0x08,0x08,0x10,0x08},
+};
+
+static void oled_fb_char(uint8_t col, uint8_t row, char c)
+{
+    if (c < 32 || c > 126) c = '?';
+    const uint8_t *glyph = font5x8[c - 32];
+    for (int i = 0; i < 5; i++) {
+        int x = col + i;
+        if (x >= OLED_H_RES) break;
+        oled_fb[row * OLED_H_RES + x] = glyph[i];
+    }
+}
+
+static void oled_fb_string(uint8_t col, uint8_t row, const char *s)
+{
+    while (*s) {
+        oled_fb_char(col, row, *s++);
+        col += 6;
+        if (col + 5 >= OLED_H_RES) break;
+    }
+}
+
+static void oled_fb_clear(void)
+{
+    memset(oled_fb, 0, sizeof(oled_fb));
+}
+
+static void oled_flush(void)
+{
+    esp_lcd_panel_draw_bitmap(oled_panel_hdl, 0, 0, OLED_H_RES, OLED_V_RES, oled_fb);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Actuadores
+// ═══════════════════════════════════════════════════════════════════════════════
+static void buzzer_on(uint32_t freq_hz)
+{
+    ledc_set_freq(BUZZER_SPEED_MODE, BUZZER_TIMER, freq_hz);
+    ledc_set_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL, 512);
+    ledc_update_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL);
+}
+static void buzzer_off(void)
+{
+    ledc_set_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL, 0);
+    ledc_update_duty(BUZZER_SPEED_MODE, BUZZER_CHANNEL);
+}
+static void rgb_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    led_strip_set_pixel(rgb_strip, 0, r, g, b);
+    led_strip_refresh(rgb_strip);
+}
+static void rgb_off(void)
+{
+    led_strip_clear(rgb_strip);
+    led_strip_refresh(rgb_strip);
+}
+
+static void actuators_init(void)
+{
+    ledc_timer_config_t tmr_buz = {
+        .speed_mode=BUZZER_SPEED_MODE, .timer_num=BUZZER_TIMER,
+        .duty_resolution=BUZZER_RESOLUTION, .freq_hz=BUZZER_FREQ_ALERT,
+        .clk_cfg=LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&tmr_buz);
+
+    ledc_channel_config_t ch_buz = {
+        .speed_mode=BUZZER_SPEED_MODE, .channel=BUZZER_CHANNEL,
+        .timer_sel=BUZZER_TIMER, .gpio_num=BUZZER_PIN, .duty=0, .hpoint=0,
+    };
+    ledc_channel_config(&ch_buz);
+
+    ledc_timer_config_t tmr_srv = {
+        .speed_mode = SERVO_SPEED_MODE,
+        .timer_num = SERVO_TIMER,
+        .duty_resolution = SERVO_RESOLUTION,
+        .freq_hz = SERVO_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&tmr_srv);
+
+    ledc_channel_config_t ch_srv = {
+        .speed_mode = SERVO_SPEED_MODE,
+        .channel = SERVO_CHANNEL,
+        .timer_sel = SERVO_TIMER,
+        .gpio_num = SERVO_PIN,
+        .duty = SERVO_DUTY_MIN,
+        .hpoint = 0,
+    };
+    ledc_channel_config(&ch_srv);
+    servo_set_angle(0);
+
+    led_strip_config_t sc = {
+        .strip_gpio_num = RGB_LED_PIN,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+    };
+    led_strip_rmt_config_t rc = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&sc, &rc, &rgb_strip));
+
+    rgb_set(0, 40, 0);   // verde inicial
+    buzzer_off();
+}
+
+static void actuators_update(void)
+{
+    alert_level_t lv;
+    xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
+    lv = g_alert;
+    xSemaphoreGive(g_alert_mutex);
+
+    switch (lv) {
+    case VITAL_NORMAL:
+        rgb_set(0, 255, 0);      // verde
+        servo_set_angle(0);
+        break;
+    case VITAL_WARN_BPM:
+        rgb_set(255, 80, 0);     // amarillo/naranja
+        servo_set_angle(45);
+        break;
+    case VITAL_WARN_SPO2:
+        rgb_set(0, 0, 255);      // azul
+        servo_set_angle(90);
+        break;
+    case VITAL_FALL:
+        break;
+    }
+}
+
+static void actuators_fall_alert(void)
+{
+    servo_set_angle(180);
+    for (int i = 0; i < 5; i++) {
+        rgb_set(255, 0, 0);      // rojo
+        buzzer_on(BUZZER_FREQ_ALERT);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        rgb_off();
+        buzzer_off();
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    rgb_set(255, 0, 0);          // rojo fijo
+}
+
+static void actuators_jolt(void)
+{
+    rgb_set(255, 80, 0);         // amarillo/naranja
+    buzzer_on(BUZZER_FREQ_JOLT);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    buzzer_off();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    actuators_update();
+}
+
+static void beep_vital_warn(void)
+{
+    buzzer_on(BUZZER_FREQ_WARN);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_off();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_on(BUZZER_FREQ_WARN);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_off();
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TAREA OLED — refresca pantalla cada 500 ms  ← NUEVO
+// ═══════════════════════════════════════════════════════════════════════════════
+static void task_oled(void *arg)
+{
+    char line[22];
+    static const char *alert_str[] = {
+        "OK  ", "BPM!", "SpO2", "FALL",
+    };
+    static const char *fall_str[] = {
+        "Idle    ", "FreeFall", "ImpWait ", "Posture ", "CAIDA!! ", "Cooldown",
+    };
+
+    ESP_LOGI(TAG_OLED, "Tarea OLED iniciada");
+
+    while (true) {
+        alert_level_t lv;
+        xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
+        lv = g_alert;
+        xSemaphoreGive(g_alert_mutex);
+
+        int bpm   = g_bpm_display;
+        int spo2  = g_spo2_display;
+        bool fing = g_finger_oled;
+        fall_state_t fst = g_fall_state_display;
+
+        oled_fb_clear();
+
+        // Línea 0 (row=0): título
+        oled_fb_string(0, 0, "=Monitor Vital=");
+
+        // Línea 1 (row=1): BPM
+        if (!fing) {
+            snprintf(line, sizeof(line), "BPM: ---");
+        } else if (bpm > 0) {
+            snprintf(line, sizeof(line), "BPM: %3d bpm", bpm);
+        } else {
+            snprintf(line, sizeof(line), "BPM: calcul...");
+        }
+        oled_fb_string(0, 1, line);
+
+        // Línea 2 (row=2): SpO2
+        if (!fing) {
+            snprintf(line, sizeof(line), "SpO2: ---");
+        } else if (spo2 > 0) {
+            snprintf(line, sizeof(line), "SpO2: %2d%%", spo2);
+        } else {
+            snprintf(line, sizeof(line), "SpO2: calcul...");
+        }
+        oled_fb_string(0, 2, line);
+
+        // Línea 3 (row=3): estado detector caída
+        snprintf(line, sizeof(line), "MPU: %s", fall_str[fst < 6 ? fst : 0]);
+        oled_fb_string(0, 3, line);
+
+        // Línea 4 (row=4): nivel de alerta + servo ángulo
+        int servo_ang = 0;
+        switch (lv) {
+            case VITAL_WARN_BPM:  servo_ang = 45;  break;
+            case VITAL_WARN_SPO2: servo_ang = 90;  break;
+            case VITAL_FALL:      servo_ang = 180; break;
+            default:              servo_ang = 0;   break;
+        }
+        snprintf(line, sizeof(line), "Alert:%s Srv:%3d", alert_str[lv], servo_ang);
+        oled_fb_string(0, 4, line);
+
+        // Línea 5 (row=5): dedo
+        oled_fb_string(0, 5, fing ? "Dedo: presente " : "Dedo: ausente  ");
+
+        oled_flush();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAX30102 — helpers I2C (sin cambios)
+// ═══════════════════════════════════════════════════════════════════════════════
+static esp_err_t max_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = {reg, val};
+    return i2c_master_transmit(dev_hdl, buf, 2, pdMS_TO_TICKS(200));
+}
+static esp_err_t max_read_reg(uint8_t reg, uint8_t *out, size_t len)
+{
+    return i2c_master_transmit_receive(dev_hdl, &reg, 1, out, len, pdMS_TO_TICKS(200));
+}
+static void hard_reset(float *bpms, float *spo2s, int *inv)
+{
+    buf_count = buf_idx = clean_samples = 0;
+    discard_count = DISCARD_ON_PLACE;
+    finger_present = false;
+    *bpms = *spo2s = 0.0f; *inv = 0;
+    g_bpm_display = 0; g_spo2_display = 0; g_finger_oled = false;
+    for (int i=0; i<WINDOW_SIZE; i++) ir_buf[i]=red_buf[i]=0;
+}
+static void soft_reset(float *bpms, float *spo2s, int *inv)
+{
+    buf_count = buf_idx = clean_samples = 0;
+    *bpms = *spo2s = 0.0f; *inv = 0;
+    g_bpm_display = 0; g_spo2_display = 0;
+    for (int i=0; i<WINDOW_SIZE; i++) ir_buf[i]=red_buf[i]=0;
+}
+static esp_err_t max30102_init(void)
+{
+    uint8_t part_id = 0;
+    esp_err_t ret = max_read_reg(REG_PART_ID, &part_id, 1);
+    if (ret != ESP_OK || part_id != 0x15) {
+        ESP_LOGE(TAG_MAX, "Part ID error: 0x%02X (esperado 0x15)", part_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG_MAX, "Part ID OK: 0x%02X", part_id);
+    max_write_reg(REG_MODE_CONFIG, 0x40);
+    uint8_t mode=0x40; int t=20;
+    while ((mode & 0x40) && t--) { vTaskDelay(pdMS_TO_TICKS(10)); max_read_reg(REG_MODE_CONFIG,&mode,1); }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    max_write_reg(REG_FIFO_CONFIG, 0x50);
+    max_write_reg(REG_MODE_CONFIG, 0x03);
+    max_write_reg(REG_SPO2_CONFIG, 0x43);
+    max_write_reg(REG_LED1_PA,     0x7F);
+    max_write_reg(REG_LED2_PA,     0x7F);
+    max_write_reg(REG_FIFO_WR_PTR, 0x00);
+    max_write_reg(REG_OVF_COUNTER, 0x00);
+    max_write_reg(REG_FIFO_RD_PTR, 0x00);
+    ESP_LOGI(TAG_MAX, "MAX30102 listo — 50SPS avg4 ~13SPS efectivos");
+    return ESP_OK;
+}
+static esp_err_t max30102_read_fifo(uint32_t *red, uint32_t *ir)
+{
+    uint8_t raw[6];
+    esp_err_t ret = max_read_reg(REG_FIFO_DATA, raw, 6);
+    if (ret != ESP_OK) return ret;
+    *red = ((uint32_t)(raw[0]&0x03)<<16)|((uint32_t)raw[1]<<8)|raw[2];
+    *ir  = ((uint32_t)(raw[3]&0x03)<<16)|((uint32_t)raw[4]<<8)|raw[5];
+    return ESP_OK;
+}
+static void linearize_buffer(uint32_t *ir_out, uint32_t *red_out, int count)
+{
+    int start = (count < WINDOW_SIZE) ? 0 : buf_idx;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % WINDOW_SIZE;
+        ir_out[i]  = ir_buf[idx];
+        red_out[i] = red_buf[idx];
+    }
+}
+static void median3_filter(uint32_t *in, float *out, int count)
+{
+    out[0] = (float)in[0];
+    if (count < 2) return;
+    out[count - 1] = (float)in[count - 1];
+    for (int i = 1; i < count - 1; i++) {
+        float a = (float)in[i - 1], b = (float)in[i], c = (float)in[i + 1];
+        float t;
+        if (a > b) { t = a; a = b; b = t; }
+        if (b > c) { t = b; b = c; c = t; }
+        if (a > b) { t = a; a = b; b = t; }
+        out[i] = b;
+    }
+}
+static void sort_float(float *arr, int n)
+{
+    for (int i=1;i<n;i++){float key=arr[i];int j=i-1;while(j>=0&&arr[j]>key){arr[j+1]=arr[j];j--;}arr[j+1]=key;}
+}
+static int calc_bpm(uint32_t *ir, int count, float *pi_out,
+                    int *dbg_peaks,int *dbg_valid,int *dbg_used,
+                    float *dbg_meaniv,float *dbg_dc,float *dbg_amp, reject_t *reason)
+{
+    *pi_out = 0;
+    *dbg_peaks = *dbg_valid = *dbg_used = 0;
+    *dbg_meaniv = *dbg_dc = *dbg_amp = 0;
+    *reason = REJ_NONE;
+
+    if (count < STABLE_SAMPLES) {
+        *reason = REJ_POCAS_MUESTRAS;
+        return 0;
+    }
+
+    static float irf[WINDOW_SIZE];
+    median3_filter(ir, irf, count);
+
+    float dc = 0;
+    for (int i = 0; i < count; i++) dc += irf[i];
+    dc /= count;
+    *dbg_dc = dc;
+
+    if (dc < 1.0f) {
+        *reason = REJ_DC_BAJO;
+        return 0;
+    }
+
+    float acmin = 1e9f, acmax = -1e9f;
+    for (int i = 0; i < count; i++) {
+        float v = irf[i] - dc;
+        if (v < acmin) acmin = v;
+        if (v > acmax) acmax = v;
+    }
+
+    float amplitude = acmax - acmin;
+    *dbg_amp = amplitude;
+    if (amplitude < 100.f) {
+        *reason = REJ_AMPLITUD_BAJA;
+        return 0;
+    }
+
+    float pi = amplitude / dc;
+    *pi_out = pi;
+    if (pi < PI_VALID_MIN || pi > PI_VALID_MAX) {
+        *reason = REJ_PI_FUERA_RANGO;
+        return 0;
+    }
+
+    float threshold = acmin + amplitude * PEAK_THRESH_PCT;
+    float crosslevel = -amplitude * CROSS_MARGIN;
+
+    static int peak_idx[MAX_PEAKS];
+    int npeaks = 0;
+    bool above = false;
+    float peak_val = -1e9f;
+    int peak_pos = -1;
+
+    for (int i = 0; i < count; i++) {
+        float v = irf[i] - dc;
+        if (!above && v > threshold) {
+            above = true;
+            peak_val = v;
+            peak_pos = i;
+        } else if (above && v > peak_val) {
+            peak_val = v;
+            peak_pos = i;
+        } else if (above && v < crosslevel) {
+            int last = npeaks > 0 ? peak_idx[npeaks - 1] : -MIN_PEAK_DIST - 1;
+            if (peak_pos - last >= MIN_PEAK_DIST && npeaks < MAX_PEAKS) {
+                peak_idx[npeaks++] = peak_pos;
+            }
+            above = false;
+            peak_val = -1e9f;
+        }
+    }
+
+    *dbg_peaks = npeaks;
+    if (npeaks < MIN_VALID_PEAKS + 1) {
+        *reason = REJ_POCOS_PICOS;
+        return 0;
+    }
+
+    int nintervals = npeaks - 1;
+    static float intervals[MAX_PEAKS];
+    for (int i = 0; i < nintervals; i++) {
+        int dist = peak_idx[i + 1] - peak_idx[i];
+        intervals[i] = (dist >= MIN_PEAK_DIST && dist <= MAX_PEAK_DIST) ? (float)dist / SAMPLE_RATE : -1.f;
+    }
+
+    static float validivs[MAX_PEAKS], sortedivs[MAX_PEAKS];
+    int nvalid = 0;
+    for (int i = 0; i < nintervals; i++) {
+        if (intervals[i] > 0) validivs[nvalid++] = intervals[i];
+    }
+
+    *dbg_valid = nvalid;
+    if (nvalid < MIN_VALID_PEAKS) {
+        *reason = REJ_POCOS_VALIDOS;
+        return 0;
+    }
+
+    for (int i = 0; i < nvalid; i++) sortedivs[i] = validivs[i];
+    sort_float(sortedivs, nvalid);
+
+    float q1 = sortedivs[nvalid / 4];
+    float q3 = sortedivs[nvalid * 3 / 4];
+    float iqr = q3 - q1, lo = q1 - IQR_FENCE * iqr, hi = q3 + IQR_FENCE * iqr;
+
+    float sum = 0;
+    int used = 0;
+    for (int i = 0; i < nvalid; i++) {
+        if (validivs[i] >= lo && validivs[i] <= hi) {
+            sum += validivs[i];
+            used++;
+        }
+    }
+
+    *dbg_used = used;
+    if (used < MIN_VALID_PEAKS) {
+        *reason = REJ_POCOS_IQR;
+        return 0;
+    }
+
+    float meaniv = sum / used;
+    *dbg_meaniv = meaniv;
+    int bpm = (int)roundf(60.f / meaniv);
+
+    if (bpm < 30 || bpm > 220) {
+        *reason = REJ_BPM_FUERA_RANGO;
+        return 0;
+    }
+    return bpm;
+
+}
+static int calc_spo2(uint32_t *red, uint32_t *ir, int count, float pi,
+                     float *dbg_R, reject_t *reason)
+{
+    *dbg_R = 0;
+    *reason = REJ_NONE;
+
+    if (count < STABLE_SAMPLES || pi < PI_VALID_MIN || pi > PI_VALID_MAX) {
+        *reason = REJ_PI_FUERA_RANGO;
+        return 0;
+    }
+
+    static float redf[WINDOW_SIZE], irf[WINDOW_SIZE];
+    median3_filter(red, redf, count);
+    median3_filter(ir, irf, count);
+
+    float reddc = 0, irdc = 0;
+    for (int i = 0; i < count; i++) {
+        reddc += redf[i];
+        irdc += irf[i];
+    }
+    reddc /= count;
+    irdc /= count;
+
+    if (reddc < 1.f || irdc < 1.f) {
+        *reason = REJ_DC_BAJO;
+        return 0;
+    }
+
+    float rr = 0, ss = 0;
+    for (int i = 0; i < count; i++) {
+        float r = redf[i] - reddc, s = irf[i] - irdc;
+        rr += r * r;
+        ss += s * s;
+    }
+
+    float redrms = sqrtf(rr / count), irrms = sqrtf(ss / count);
+    if (irrms < 1.f || redrms < 1.f) {
+        *reason = REJ_AMPLITUD_BAJA;
+        return 0;
+    }
+
+    float R = (redrms / reddc) / (irrms / irdc);
+    *dbg_R = R;
+    if (R < SPO2_R_MIN || R > SPO2_R_MAX) {
+        *reason = REJ_SPO2_R_FUERA;
+        return 0;
+    }
+
+    float spo2 = -45.060f * R * R + 30.354f * R + 94.845f;
+    if (spo2 > 100.f) spo2 = 100.f;
+    if (spo2 < 80.f) {
+        *reason = REJ_SPO2_BAJO;
+        return 0;
+    }
+
+    return (int)roundf(spo2);
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TAREA MAX30102 (se agregan escrituras a g_bpm_display / g_spo2_display)
+// ═══════════════════════════════════════════════════════════════════════════════
+static void task_max30102(void *arg)
+{
+    float bpm_smooth=0.f, spo2_smooth=0.f;
+    int inv_count=0;
+    TickType_t last_report = xTaskGetTickCount();
+    uint32_t ir_lin[WINDOW_SIZE], red_lin[WINDOW_SIZE];
+
+    while (true) {
+        xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
+        bool falling = (g_alert == VITAL_FALL);
+        xSemaphoreGive(g_alert_mutex);
+        if (falling) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        uint8_t wr=0,rd=0,ovf=0;
+        max_read_reg(REG_FIFO_WR_PTR,&wr,1);
+        max_read_reg(REG_FIFO_RD_PTR,&rd,1);
+        max_read_reg(REG_OVF_COUNTER,&ovf,1);
+        if (ovf) max_write_reg(REG_OVF_COUNTER,0x00);
+
+        uint8_t ns = (wr-rd) & 0x1F;
+        for (uint8_t i=0; i<ns; i++) {
+            uint32_t red=0,ir=0;
+            if (max30102_read_fifo(&red,&ir) != ESP_OK) continue;
+            if (ir < FINGER_THRESH) {
+                if (finger_present) {
+                    ESP_LOGI(TAG_MAX,"Dedo retirado — reiniciando...");
+                    hard_reset(&bpm_smooth,&spo2_smooth,&inv_count);
+                    xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+                    if (g_alert == VITAL_WARN_BPM || g_alert == VITAL_WARN_SPO2)
+                        g_alert = VITAL_NORMAL;
+                    xSemaphoreGive(g_alert_mutex);
+                    actuators_update();
+                }
+                continue;
+            }
+            if (!finger_present) {
+                hard_reset(&bpm_smooth,&spo2_smooth,&inv_count);
+                finger_present = true;
+                g_finger_oled = true;   // ← OLED
+                ESP_LOGI(TAG_MAX,"Dedo detectado — descartando %d muestras transitorio...",DISCARD_ON_PLACE);
+            }
+            if (discard_count > 0) { discard_count--; continue; }
+            ir_buf[buf_idx]  = ir;
+            red_buf[buf_idx] = red;
+            buf_idx = (buf_idx+1) % WINDOW_SIZE;
+            if (buf_count < WINDOW_SIZE) buf_count++;
+            if (clean_samples < WINDOW_SIZE) clean_samples++;
+        }
+
+        if ((xTaskGetTickCount()-last_report) < pdMS_TO_TICKS(2000)) {
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        last_report = xTaskGetTickCount();
+
+        if (!finger_present || buf_count == 0) {
+            ESP_LOGI(TAG_MAX,"Pon el dedo sobre el sensor...");
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        if (clean_samples < STABLE_SAMPLES) {
+            ESP_LOGI(TAG_MAX,"Estabilizando... %d/%d — no muevas el dedo",clean_samples,STABLE_SAMPLES);
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+
+        linearize_buffer(ir_lin,red_lin,buf_count);
+        float pi=0,dbg_dc=0,dbg_amp=0,dbg_meaniv=0,dbg_R=0;
+        int dbg_peaks=0,dbg_valid=0,dbg_used=0;
+        reject_t rej_bpm=REJ_NONE,rej_spo2=REJ_NONE;
+        int bpm  = calc_bpm (ir_lin,buf_count,&pi,&dbg_peaks,&dbg_valid,&dbg_used,&dbg_meaniv,&dbg_dc,&dbg_amp,&rej_bpm);
+        int spo2 = calc_spo2(red_lin,ir_lin,buf_count,pi,&dbg_R,&rej_spo2);
+
+#if DBG_LEVEL >= 1
+        if (!bpm) ESP_LOGW(TAG_MAX,"BPM rechazado: %s | picos=%d valid=%d used=%d pi=%.4f amp=%.0f",rej_str[rej_bpm],dbg_peaks,dbg_valid,dbg_used,pi,dbg_amp);
+        if (!spo2 && rej_spo2!=REJ_PI_FUERA_RANGO) ESP_LOGW(TAG_MAX,"SpO2 rechazado: %s | R=%.4f",rej_str[rej_spo2],dbg_R);
+#endif
+
+        alert_level_t new_alert = VITAL_NORMAL;
+
+        if (bpm > 0) {
+            inv_count = 0;
+            bpm_smooth = (bpm_smooth==0.f) ? (float)bpm : EMA_BPM*(float)bpm+(1.f-EMA_BPM)*bpm_smooth;
+            if (spo2 > 0) spo2_smooth = (spo2_smooth==0.f) ? (float)spo2 : EMA_SPO2*(float)spo2+(1.f-EMA_SPO2)*spo2_smooth;
+
+            int bpm_r  = (int)roundf(bpm_smooth);
+            int spo2_r = (spo2_smooth>0.f) ? (int)roundf(spo2_smooth) : 0;
+
+            // Actualizar OLED  ← NUEVO
+            g_bpm_display  = bpm_r;
+            g_spo2_display = spo2_r;
+
+            if (spo2_r > 0 && spo2_r < SPO2_LOW) {
+                new_alert = VITAL_WARN_SPO2;
+                ESP_LOGW(TAG_MAX,"⚠ SpO2 BAJO: %d%%  BPM: %d", spo2_r, bpm_r);
+            } else if (bpm_r < BPM_LOW || bpm_r > BPM_HIGH) {
+                new_alert = VITAL_WARN_BPM;
+                ESP_LOGW(TAG_MAX,"⚠ BPM ANORMAL: %d  SpO2: %s", bpm_r, spo2_r>0?"--":"%d");
+            }
+
+            if (spo2_r > 0)
+                ESP_LOGI(TAG_MAX,"BPM: %3d  SpO2: %2d%%  PI: %.4f", bpm_r, spo2_r, pi);
+            else
+                ESP_LOGI(TAG_MAX,"BPM: %3d  SpO2: ---   PI: %.4f", bpm_r, pi);
+
+        } else {
+            inv_count++;
+            if (bpm_smooth > 0.f && inv_count < MAX_INVALID) {
+                ESP_LOGI(TAG_MAX,"BPM: %3d  SpO2: %s  PI: %.4f [senal debil %d/%d]",
+                    (int)roundf(bpm_smooth),
+                    spo2_smooth>0.f ? "ok" : "---", pi, inv_count, MAX_INVALID);
+            } else {
+                soft_reset(&bpm_smooth,&spo2_smooth,&inv_count);
+                finger_present = true;
+                g_finger_oled = true;
+                ESP_LOGW(TAG_MAX,"Recalibrando — manten el dedo quieto %ds",STABLE_SAMPLES/SAMPLE_RATE);
+            }
+        }
+
+        xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+        if (g_alert != VITAL_FALL) {
+            bool changed = (g_alert != new_alert);
+            g_alert = new_alert;
+            xSemaphoreGive(g_alert_mutex);
+            if (changed) {
+                actuators_update();
+                if (new_alert == VITAL_WARN_BPM || new_alert == VITAL_WARN_SPO2)
+                    beep_vital_warn();
+            }
+        } else {
+            xSemaphoreGive(g_alert_mutex);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TAREA MPU6050 (se agrega escritura a g_fall_state_display)
+// ═══════════════════════════════════════════════════════════════════════════════
+static void calibrate_mpu(mpu6050_handle_t mpu)
+{
+    ESP_LOGI(TAG_MPU,"=== CALIBRACION: sensor QUIETO y PLANO. Iniciando en 3s... ===");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    double sax=0,say=0,saz=0,sgx=0,sgy=0,sgz=0;
+    mpu6050_gyro_data_axes_t gyro; mpu6050_accel_data_axes_t accel; float temp=0;
+    for(int i=0;i<CALIB_SAMPLES;i++){
+        ESP_ERROR_CHECK(mpu6050_get_motion(mpu,&gyro,&accel,&temp));
+        sax+=accel.x_axis;say+=accel.y_axis;saz+=accel.z_axis;
+        sgx+=gyro.x_axis;sgy+=gyro.y_axis;sgz+=gyro.z_axis;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG_MPU,"┌─ REFERENCIA ─────────────────────────────────────────────");
+    ESP_LOGI(TAG_MPU,"│  ax=%.5f ay=%.5f az=%.5f",(float)(sax/CALIB_SAMPLES),(float)(say/CALIB_SAMPLES),(float)(saz/CALIB_SAMPLES)-1.f);
+    ESP_LOGI(TAG_MPU,"│  gx=%.5f gy=%.5f gz=%.5f",(float)(sgx/CALIB_SAMPLES),(float)(sgy/CALIB_SAMPLES),(float)(sgz/CALIB_SAMPLES));
+    ESP_LOGI(TAG_MPU,"└───────────────────────────────────────────────────────────");
+}
+
+static void task_mpu6050(void *arg)
+{
+    mpu6050_handle_t mpu = (mpu6050_handle_t)arg;
+
+    fall_state_t state = STATE_IDLE;
+    TickType_t phase_start = xTaskGetTickCount();
+    float ema_mag=1.f, ema_gyr=0.f;
+    uint32_t last_idle_print=0;
+
+    ESP_LOGI(TAG_MPU,"");
+    ESP_LOGI(TAG_MPU,"╔══════════════════════════════════════════════╗");
+    ESP_LOGI(TAG_MPU,"║   DETECCION DE CAIDAS ACTIVA — 50Hz          ║");
+    ESP_LOGI(TAG_MPU,"╚══════════════════════════════════════════════╝");
+
+    mpu6050_gyro_data_axes_t gyro; mpu6050_accel_data_axes_t accel; float temp=0;
+
+    while (true) {
+        if (mpu6050_get_motion(mpu,&gyro,&accel,&temp) != ESP_OK){
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        float ax=accel.x_axis-offset_ax, ay=accel.y_axis-offset_ay, az=accel.z_axis-offset_az;
+        float gx=gyro.x_axis-offset_gx,  gy=gyro.y_axis-offset_gy,  gz=gyro.z_axis-offset_gz;
+        float raw_mag  = sqrtf(ax*ax+ay*ay+az*az);
+        float raw_gmag = sqrtf(gx*gx+gy*gy+gz*gz);
+        ema_mag = EMA_ALPHA*raw_mag  + (1.f-EMA_ALPHA)*ema_mag;
+        ema_gyr = EMA_ALPHA*raw_gmag + (1.f-EMA_ALPHA)*ema_gyr;
+
+        TickType_t now = xTaskGetTickCount();
+        uint32_t elapsed_ms = (uint32_t)((now-phase_start)*portTICK_PERIOD_MS);
+
+        g_fall_state_display = state;   // ← OLED
+
+#if DEBUG_MODE
+        if(state==STATE_IDLE&&(elapsed_ms-last_idle_print)>=2000){
+            last_idle_print=elapsed_ms;
+            ESP_LOGI(TAG_MPU,"[IDLE] ema=%.3fg gyr=%.1fdeg/s az=%.3fg",ema_mag,ema_gyr,az);
+        }
+        if(state==STATE_FREEFALL)
+            ESP_LOGI(TAG_MPU,"  [FF]   ema=%.3fg elapsed=%lums/%dms",ema_mag,(unsigned long)elapsed_ms,FREEFALL_MIN_MS);
+        if(state==STATE_IMPACT_WAIT)
+            ESP_LOGI(TAG_MPU,"  [IMP]  raw=%.3fg elapsed=%lums/%dms",raw_mag,(unsigned long)elapsed_ms,IMPACT_WINDOW_MS);
+        if(state==STATE_POSTURE_CHECK)
+            ESP_LOGI(TAG_MPU,"  [POST] gyr=%.1fdeg/s az=%.3fg elapsed=%lums/%dms",ema_gyr,az,(unsigned long)elapsed_ms,POSTURE_WINDOW_MS);
+#endif
+
+        switch(state){
+        case STATE_IDLE:
+            last_idle_print=elapsed_ms;
+            if(ema_mag<FREEFALL_THRESH){
+                state=STATE_FREEFALL; phase_start=now;
+                ESP_LOGI(TAG_MPU,">> [FASE 1] Free-fall? ema=%.3fg",ema_mag);
+            } else if(raw_mag>JOLT_THRESH){
+                ESP_LOGW(TAG_MPU,"Movimiento brusco |a|=%.2fg",raw_mag);
+                actuators_jolt();
+            }
+            break;
+
+        case STATE_FREEFALL:
+            if(ema_mag>=FREEFALL_THRESH){
+                ESP_LOGI(TAG_MPU,"  [FF] Cancelado en %lums",(unsigned long)elapsed_ms);
+                state=STATE_IDLE; phase_start=now;
+            } else if(elapsed_ms>=FREEFALL_MIN_MS){
+                state=STATE_IMPACT_WAIT; phase_start=now;
+                ESP_LOGI(TAG_MPU,"✓ [FASE 1 OK] Free-fall %lums — esperando impacto...",(unsigned long)elapsed_ms);
+            }
+            break;
+
+        case STATE_IMPACT_WAIT:
+            if(raw_mag>IMPACT_THRESH){
+                state=STATE_POSTURE_CHECK; phase_start=now;
+                rgb_set(255,80,0);
+                ESP_LOGI(TAG_MPU,"✓ [FASE 2 OK] Impacto %.2fg — verificando postura...",raw_mag);
+            } else if(elapsed_ms>IMPACT_WINDOW_MS){
+                ESP_LOGI(TAG_MPU,"  [IMP] Sin impacto en %dms → descartado",IMPACT_WINDOW_MS);
+                state=STATE_IDLE; phase_start=now;
+            }
+            break;
+
+        case STATE_POSTURE_CHECK:
+            if(elapsed_ms>=POSTURE_WINDOW_MS){
+                bool quieto=(ema_gyr<POSTURE_GYRO_THRESH);
+                bool tumbado=true;
+                ESP_LOGI(TAG_MPU,"✓ [FASE 3] gyr=%.1f quieto=%d az=%.3f tumbado=%d",ema_gyr,(int)quieto,az,(int)tumbado);
+                if(quieto&&tumbado){
+                    state=STATE_FALL_CONFIRMED;
+                } else {
+                    ESP_LOGI(TAG_MPU,"  [POST] Giroscopio activo → descartado");
+                    rgb_set(0, 255, 0);
+                    state=STATE_IDLE; phase_start=now;
+                }
+            }
+            break;
+
+        case STATE_FALL_CONFIRMED:
+            xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+            g_alert=VITAL_FALL;
+            xSemaphoreGive(g_alert_mutex);
+            ESP_LOGW(TAG_MPU,"╔══════════════════════════════╗");
+            ESP_LOGW(TAG_MPU,"║   !!! CAIDA CONFIRMADA !!!   ║");
+            ESP_LOGW(TAG_MPU,"╚══════════════════════════════╝");
+            actuators_fall_alert();   // servo ya va a 180° aquí
+            state=STATE_COOLDOWN;
+            phase_start=xTaskGetTickCount();
+            break;
+
+        case STATE_COOLDOWN:
+            if(elapsed_ms>=FALL_COOLDOWN_MS){
+                ESP_LOGI(TAG_MPU,"Cooldown terminado → volviendo a monitoreo");
+                xSemaphoreTake(g_alert_mutex,portMAX_DELAY);
+                g_alert=VITAL_NORMAL;
+                xSemaphoreGive(g_alert_mutex);
+                actuators_update();   // servo vuelve a 0°
+                state=STATE_IDLE;
+                phase_start=xTaskGetTickCount();
+            }
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  APP MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
+void app_main(void)
+{
+    // Mutex compartido
+    g_alert_mutex = xSemaphoreCreateMutex();
+    configASSERT(g_alert_mutex);
+
+    // Bus I2C compartido (MAX30102 + MPU6050 + SSD1306)
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port=I2C_MASTER_PORT, .sda_io_num=I2C_MASTER_SDA_IO,
+        .scl_io_num=I2C_MASTER_SCL_IO, .clk_source=I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt=7, .flags.enable_internal_pullup=true,
+    };
+    i2c_master_bus_handle_t i2c_bus=NULL;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg,&i2c_bus));
+
+    // MAX30102
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length=I2C_ADDR_BIT_LEN_7,
+        .device_address=MAX30102_ADDR,
+        .scl_speed_hz=I2C_SPEED_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus,&dev_cfg,&dev_hdl));
+    if (max30102_init() != ESP_OK) {
+        ESP_LOGE(TAG_MAX,"Init fallida. Revisa el cableado."); return;
+    }
+
+    // MPU6050
+    mpu6050_config_t mpu_cfg = I2C_MPU6050_CONFIG_DEFAULT;
+    mpu_cfg.i2c_clock_speed=I2C_SPEED_HZ;
+    mpu_cfg.gyro_full_scale_range=MPU6050_GYRO_FS_RANGE_500DPS;
+    mpu_cfg.accel_full_scale_range=MPU6050_ACCEL_FS_RANGE_4G;
+    mpu_cfg.irq_io_num=GPIO_NUM_NC;
+    mpu6050_handle_t mpu=NULL;
+    ESP_ERROR_CHECK(mpu6050_init(i2c_bus,&mpu_cfg,&mpu));
+    ESP_ERROR_CHECK(mpu6050_reset(mpu));
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    mpu6050_who_am_i_register_t whoami;
+    ESP_ERROR_CHECK(mpu6050_get_who_am_i_register(mpu,&whoami));
+    ESP_LOGI(TAG_MPU,"MPU6050 OK — WHOAMI: 0x%02X",whoami.bits.who_am_i);
+
+    // ── OLED SSD1306 via esp_lcd  ← NUEVO ────────────────────────────────────
+    esp_lcd_panel_io_i2c_config_t io_cfg = {
+        .dev_addr = OLED_I2C_ADDR,
+        .scl_speed_hz = 100000,
+        .control_phase_bytes = 1,
+        .dc_bit_offset = 6,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .flags = {
+            .disable_control_phase = 0,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus, &io_cfg, &oled_io_hdl));
+
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .bits_per_pixel = 1,
+        .reset_gpio_num = GPIO_NUM_NC,
+    };
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(oled_io_hdl, &panel_cfg, &oled_panel_hdl));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(oled_panel_hdl));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(oled_panel_hdl));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(oled_panel_hdl, true));
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Actuadores (buzzer, servo, RGB, LED verde)
+    actuators_init();
+
+    // Secuencia arranque: verde → amarillo → rojo + 2 beeps + servo sweep
+    ESP_LOGI("BOOT","Prueba de actuadores...");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    rgb_set(255,80,0);
+    servo_set_angle(45);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    rgb_set(255,0,0); servo_set_angle(90);
+    buzzer_on(BUZZER_FREQ_ALERT);
+    vTaskDelay(pdMS_TO_TICKS(400)); buzzer_off();
+    servo_set_angle(180);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    buzzer_on(BUZZER_FREQ_ALERT);
+    vTaskDelay(pdMS_TO_TICKS(400)); buzzer_off();
+    servo_set_angle(0);   // vuelve a reposo
+    actuators_update();
+    ESP_LOGI("BOOT","Actuadores OK");
+
+    // OLED boot OK
+    oled_fb_clear();
+    oled_fb_string(0, 0, "=Monitor Vital=");
+    oled_fb_string(0, 2, "Boot OK!");
+    oled_flush();
+
+    // Calibración MPU
+    calibrate_mpu(mpu);
+
+    // Lanzar tareas
+    xTaskCreate(task_max30102, "max30102", 4096, NULL,      5, NULL);
+    xTaskCreate(task_mpu6050,  "mpu6050",  4096, (void*)mpu, 6, NULL);
+    xTaskCreate(task_oled,     "oled",     3072, NULL,      4, NULL);
+    // Prioridades: mpu6050(6) > max30102(5) > oled(4)
+}
