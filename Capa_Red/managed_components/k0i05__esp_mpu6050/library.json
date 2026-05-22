@@ -1,0 +1,25 @@
+{
+  "name": "esp_mpu6050",
+  "keywords": "esp32, espressif, espidf, invensense, mpu6050, i2c, accelerometer, gyroscope, motion",
+  "description": "ESP32 espressif IoT development framework (esp-idf) compatible component for InvenSense MPU6050 6-axis motion tracking I2C sensor.",
+  "authors": [
+    {
+      "name": "Eric Gionet",
+      "email": "gionet.c.eric@gmail.com",
+      "maintainer": true
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/K0I05/ESP32-S3_ESP-IDF_COMPONENTS/tree/main/components/peripherals/i2c/esp_mpu6050"
+  },
+  "homepage": "https://github.com/K0I05/ESP32-S3_ESP-IDF_COMPONENTS",
+  "version": "1.2.7",
+  "license": "MIT",
+  "frameworks": "espidf",
+  "platforms": "espressif32",
+  "headers": "mpu6050.h",
+  "dependencies": {
+    "k0i05/esp_type_utils": ">=1.0.0"
+  }
+}

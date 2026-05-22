@@ -1,0 +1,5 @@
+dependencies:
+  espressif/mqtt: "*"
+  espressif/led_strip: ">=2.5.5"
+  k0i05/esp_mpu6050: ">=1.2.7"
+  idf: ">=5.0.0"
