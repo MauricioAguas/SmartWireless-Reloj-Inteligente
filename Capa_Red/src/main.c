@@ -145,22 +145,6 @@ static esp_mqtt_client_handle_t mqtt_client = NULL;
 static volatile bool mqtt_connected = false;
 
 /* =========================================================
-   VARIABLES COMPARTIDAS
-   =========================================================
-   Estas variables normalmente ya viven en tu capa modular.
-   Si en shared.c/shared.h ya están definidas globalmente,
-   elimina estas definiciones de aquí y deja solo los extern
-   en shared.h para evitar "multiple definition".
-   ========================================================= */
-
-// volatile alert_level_t g_alert = VITAL_NORMAL;
-// SemaphoreHandle_t g_alert_mutex = NULL;
-// volatile int g_bpm_display = 0;
-// volatile int g_spo2_display = 0;
-// volatile bool g_finger_oled = false;
-// volatile fall_state_t g_fall_state_display = STATE_IDLE;
-
-/* =========================================================
    WIFI EVENT HANDLER
    ========================================================= */
 
@@ -177,6 +161,7 @@ static void wifi_event_handler(
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         ESP_LOGW(TAG, "WiFi desconectado, reconectando...");
+        g_wifi_ready = false;
         esp_wifi_connect();
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
@@ -184,6 +169,7 @@ static void wifi_event_handler(
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi conectado");
         ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        g_wifi_ready = true;   // <-- OLED deja de mostrar "Conectando WiFi..."
     }
 }
 
@@ -251,6 +237,7 @@ static void obtain_time(void)
         localtime_r(&now, &timeinfo);
     }
 
+    g_ntp_ready = true;   // <-- OLED deja de mostrar "Sync NTP..."
     ESP_LOGI(TAG, "Hora sincronizada");
 }
 
@@ -430,14 +417,9 @@ void app_main(void)
     actuators_init();
     actuators_update();
 
-    oled_fb_clear();
-    oled_fb_string(0, 0, "=Monitor Vital=");
-    oled_fb_string(0, 2, "Boot OK!");
-    oled_flush();
-
     xTaskCreate(task_max30102, "max30102", 4096, NULL, 5, NULL);
     xTaskCreate(task_mpu6050, "mpu6050", 4096, (void *)mpu, 6, NULL);
-    xTaskCreate(task_oled, "oled", 3072, NULL, 4, NULL);
+    xTaskCreate(task_oled,    "oled",     3072, NULL,        4, NULL);
     xTaskCreate(mqtt_publish_task, "mqtt_publish", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Todas las tareas lanzadas");
