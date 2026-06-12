@@ -17,7 +17,11 @@ static const char *TAG_OLED = "OLED";
 
 static esp_lcd_panel_io_handle_t oled_io_hdl    = NULL;
 static esp_lcd_panel_handle_t    oled_panel_hdl = NULL;
+
+// Framebuffer principal (se escribe normalmente)
 static uint8_t oled_fb[OLED_H_RES * OLED_V_RES / 8];
+// Framebuffer rotado 180 que se envia al panel
+static uint8_t oled_fb_rot[OLED_H_RES * OLED_V_RES / 8];
 
 // =========================================================================
 //  Fuente 5x8
@@ -75,9 +79,40 @@ void oled_fb_clear(void)
     memset(oled_fb, 0, sizeof(oled_fb));
 }
 
+// =========================================================================
+//  Rotacion 180 por software + flush al panel
+//
+//  El SSD1306 organiza la VRAM en paginas de 8 filas (1 byte = 8 pixeles
+//  verticales). Para rotar 180 hay que:
+//    1. Invertir el orden de las paginas  (ultima pag -> primera)
+//    2. Invertir el orden de las columnas (ultima col -> primera)
+//    3. Invertir los bits del byte        (reflejo vertical de la pagina)
+// =========================================================================
+
+static uint8_t reverse_byte(uint8_t b)
+{
+    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+    b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+    return b;
+}
+
 void oled_flush(void)
 {
-    esp_lcd_panel_draw_bitmap(oled_panel_hdl, 0, 0, OLED_H_RES, OLED_V_RES, oled_fb);
+    const int pages = OLED_V_RES / 8;   // 64 / 8 = 8 paginas
+    const int cols  = OLED_H_RES;       // 128 columnas
+
+    for (int p = 0; p < pages; p++) {
+        int p_src = (pages - 1) - p;    // pagina simetrica
+        for (int c = 0; c < cols; c++) {
+            int c_src = (cols - 1) - c; // columna simetrica
+            oled_fb_rot[p * cols + c] =
+                reverse_byte(oled_fb[p_src * cols + c_src]);
+        }
+    }
+
+    esp_lcd_panel_draw_bitmap(oled_panel_hdl, 0, 0,
+                              OLED_H_RES, OLED_V_RES, oled_fb_rot);
 }
 
 // =========================================================================
@@ -86,7 +121,6 @@ void oled_flush(void)
 
 static void get_time_string(char *out, size_t len)
 {
-    // Asegurar TZ Colombia aqui mismo, independiente de cuando se llamo oled_init
     setenv("TZ", "COT5", 1);
     tzset();
 
@@ -126,13 +160,10 @@ void oled_init(i2c_master_bus_handle_t i2c_bus)
     ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(oled_io_hdl, &panel_cfg, &oled_panel_hdl));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(oled_panel_hdl));
     ESP_ERROR_CHECK(esp_lcd_panel_init(oled_panel_hdl));
-
-    // Rotar 180 grados (mirror en ambos ejes)
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(oled_panel_hdl, true, true));
-
+    // Sin mirror() en el panel: la rotacion se hace por software en oled_flush()
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(oled_panel_hdl, true));
 
-    ESP_LOGI(TAG_OLED, "SSD1306 inicializado OK (rotado 180)");
+    ESP_LOGI(TAG_OLED, "SSD1306 OK (rotacion 180 por software)");
 }
 
 // =========================================================================
