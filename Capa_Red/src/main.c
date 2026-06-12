@@ -207,34 +207,17 @@ static void wifi_init(void)
 }
 
 /* =========================================================
-   NTP local apuntando a la Raspberry (192.168.50.1)
-
-   REQUISITO en la Raspberry (ejecutar una sola vez):
-
-     sudo apt install chrony -y
-     echo "local stratum 8 orphan" | sudo tee -a /etc/chrony/chrony.conf
-     echo "allow 192.168.50.0/24"  | sudo tee -a /etc/chrony/chrony.conf
-     sudo systemctl restart chrony
-
-   Verificar que funciona:
-     chronyc tracking          <- muestra hora local
-     chronyc clients           <- debe aparecer 192.168.50.x del ESP32
-
-   Si no tienes chrony instalado aun, verifica con:
-     timedatectl               <- debe decir NTP service: active
+   NTP
    ========================================================= */
 
 static void obtain_time(void)
 {
     ESP_LOGI(TAG, "Sincronizando hora con Raspberry: %s", NTP_SERVER);
 
-    // Zona horaria Colombia (UTC-5, sin DST)
     setenv("TZ", "COT5", 1);
     tzset();
 
-    if (esp_sntp_enabled()) {
-        esp_sntp_stop();
-    }
+    if (esp_sntp_enabled()) esp_sntp_stop();
 
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, NTP_SERVER);
@@ -243,16 +226,14 @@ static void obtain_time(void)
     time_t now = 0;
     struct tm timeinfo = {0};
     int retry = 0;
-    const int retry_max = 20;   // 20 x 2 s = 40 s maximo
+    const int retry_max = 20;
 
     while (retry < retry_max) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         time(&now);
         localtime_r(&now, &timeinfo);
-
         ESP_LOGI(TAG, "NTP intento %d/%d - anio=%d",
                  retry + 1, retry_max, timeinfo.tm_year + 1900);
-
         if (timeinfo.tm_year >= (2024 - 1900)) {
             g_ntp_ready = true;
             ESP_LOGI(TAG, "Hora OK: %04d-%02d-%02d %02d:%02d:%02d (COT)",
@@ -263,10 +244,8 @@ static void obtain_time(void)
         }
         retry++;
     }
-
-    // Timeout: continua sin hora para no bloquear el sistema
     g_ntp_ready = true;
-    ESP_LOGE(TAG, "Timeout NTP. Verifica chrony en la Raspberry (%s).", NTP_SERVER);
+    ESP_LOGE(TAG, "Timeout NTP.");
 }
 
 /* =========================================================
@@ -312,10 +291,7 @@ static void mqtt_app_start(void)
     };
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    if (mqtt_client == NULL) {
-        ESP_LOGE(TAG, "No se pudo crear cliente MQTT");
-        return;
-    }
+    if (!mqtt_client) { ESP_LOGE(TAG, "No se pudo crear cliente MQTT"); return; }
 
     ESP_ERROR_CHECK(esp_mqtt_client_register_event(
         mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
@@ -329,16 +305,13 @@ static void mqtt_app_start(void)
 static void mqtt_publish_task(void *pvParameters)
 {
     char payload[160];
-
     while (1) {
-        if (!mqtt_connected || mqtt_client == NULL) {
+        if (!mqtt_connected || !mqtt_client) {
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
-
         int bpm = 0, spo2 = 0, fall_state = 0, alert = 0;
         bool finger = false;
-
         if (xSemaphoreTake(g_alert_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             bpm        = g_bpm_display;
             spo2       = g_spo2_display;
@@ -347,30 +320,35 @@ static void mqtt_publish_task(void *pvParameters)
             alert      = (int)g_alert;
             xSemaphoreGive(g_alert_mutex);
         } else {
-            ESP_LOGW(TAG, "No se pudo tomar mutex para publicar");
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-
         snprintf(payload, sizeof(payload),
                  "{\"bpm\":%d,\"spo2\":%d,\"finger\":%s,\"fall\":%d,\"alert\":%d}",
                  bpm, spo2, finger ? "true" : "false", fall_state, alert);
-
         int msg_id = esp_mqtt_client_publish(
             mqtt_client, MQTT_TOPIC_DATA, payload, 0, 1, 0);
         ESP_LOGI(TAG, "MQTT pub id=%d %s", msg_id, payload);
-
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
 /* =========================================================
    APP MAIN
+
+   Orden de arranque:
+   1. NVS + mutex
+   2. I2C bus (necesario para OLED)
+   3. OLED init + tarea OLED  <-- arranca ANTES del WiFi
+                                  para mostrar pantalla de estado
+   4. WiFi (asincrono)
+   5. Esperar IP -> NTP -> MQTT  (la tarea OLED muestra el progreso)
+   6. Sensores + resto de tareas
    ========================================================= */
 
 void app_main(void)
 {
-    // NVS
+    // 1. NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -379,26 +357,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Mutex primero, antes de cualquier tarea
+    // Mutex antes de cualquier tarea
     g_alert_mutex = xSemaphoreCreateMutex();
     configASSERT(g_alert_mutex);
 
-    // WiFi (asincrono, g_wifi_ready se activa en el event handler)
-    wifi_init();
-
-    // Bloquear hasta tener IP real
-    ESP_LOGI(TAG, "Esperando IP de la Raspberry...");
-    while (!g_wifi_ready) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    // NTP desde la Raspberry local
-    obtain_time();
-
-    // MQTT TLS
-    mqtt_app_start();
-
-    // Bus I2C compartido
+    // 2. Bus I2C (compartido por OLED, MAX30102, MPU6050)
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port                     = I2C_MASTER_PORT,
         .sda_io_num                   = I2C_MASTER_SDA_IO,
@@ -411,6 +374,25 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
     ESP_LOGI(TAG, "Bus I2C inicializado");
 
+    // 3. OLED — arranca ANTES del WiFi
+    oled_init(i2c_bus);
+    xTaskCreate(task_oled, "oled", 3072, NULL, 4, NULL);
+    ESP_LOGI(TAG, "OLED lista, mostrando pantalla de arranque");
+
+    // 4. WiFi (asincrono — la tarea OLED muestra "WiFi....")
+    wifi_init();
+
+    // 5a. Esperar IP
+    ESP_LOGI(TAG, "Esperando IP...");
+    while (!g_wifi_ready) vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 5b. NTP (la tarea OLED muestra "NTP....")
+    obtain_time();
+
+    // 5c. MQTT TLS
+    mqtt_app_start();
+
+    // 6. Sensores
     if (max30102_init_device(i2c_bus) != ESP_OK) {
         ESP_LOGE(TAG, "MAX30102 init fallida");
         return;
@@ -422,13 +404,11 @@ void app_main(void)
         return;
     }
 
-    oled_init(i2c_bus);
     actuators_init();
     actuators_update();
 
     xTaskCreate(task_max30102,     "max30102",     4096, NULL,        5, NULL);
     xTaskCreate(task_mpu6050,      "mpu6050",      4096, (void *)mpu, 6, NULL);
-    xTaskCreate(task_oled,         "oled",         3072, NULL,        4, NULL);
     xTaskCreate(mqtt_publish_task, "mqtt_publish", 4096, NULL,        5, NULL);
 
     ESP_LOGI(TAG, "Todas las tareas lanzadas");

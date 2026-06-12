@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 static const char *TAG_OLED = "OLED";
 
@@ -19,7 +20,8 @@ static esp_lcd_panel_handle_t    oled_panel_hdl = NULL;
 static uint8_t oled_fb[OLED_H_RES * OLED_V_RES / 8];
 
 // =========================================================================
-//  Fuente 5x8
+//  Fuente 5x8 — glyph 'd' (ASCII 100, indice 68) corregido
+//  Patron correcto de 'd': {0x38,0x44,0x44,0x48,0x7F}
 // =========================================================================
 
 static const uint8_t font5x8[][5] = {
@@ -40,7 +42,9 @@ static const uint8_t font5x8[][5] = {
     {0x63,0x14,0x08,0x14,0x63},{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
     {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},{0x40,0x40,0x40,0x40,0x40},
     {0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},
-    {0x38,0x44,0x44,0x48,0x7F},{0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
+    /* 'd' ASCII 100, indice 68 — CORREGIDO: {0x38,0x44,0x44,0x48,0x7F} es 'q', el correcto es: */
+    {0x38,0x44,0x44,0x24,0x7F},
+    {0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
     {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},{0x7F,0x10,0x28,0x44,0x00},
     {0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},
     {0x7C,0x14,0x14,0x14,0x08},{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
@@ -109,6 +113,12 @@ void oled_init(i2c_master_bus_handle_t i2c_bus)
 
 // =========================================================================
 //  Tarea FreeRTOS
+//
+//  Fase 1 (arranque): muestra el progreso de conexion WiFi y NTP
+//                     usando las flags g_wifi_ready y g_ntp_ready
+//                     que se van poniendo en true desde app_main.
+//
+//  Fase 2 (normal):   muestra signos vitales, estado MPU y hora.
 // =========================================================================
 
 void task_oled(void *arg)
@@ -122,6 +132,47 @@ void task_oled(void *arg)
 
     ESP_LOGI(TAG_OLED, "Tarea OLED iniciada");
 
+    // ---- FASE 1: pantalla de arranque ----
+    // Se muestra mientras WiFi o NTP aun no esten listos.
+    // Cada medio segundo actualiza el punto animado para dar
+    // feedback visual sin bloquear el scheduler.
+    uint8_t dots = 0;
+    while (!g_wifi_ready || !g_ntp_ready) {
+        oled_fb_clear();
+        oled_fb_string(0, 0, "SmartWireless");
+        oled_fb_string(0, 1, "---------------");
+
+        if (!g_wifi_ready) {
+            // Animacion de puntos: "WiFi.." / "WiFi..." / "WiFi...."
+            snprintf(line, sizeof(line), "WiFi%.*s",
+                     (dots % 4) + 1, "....");
+            oled_fb_string(0, 2, line);
+            oled_fb_string(0, 3, WIFI_SSID_DISPLAY);
+            oled_fb_string(0, 4, "Conectando...");
+        } else {
+            // WiFi OK, esperando NTP
+            oled_fb_string(0, 2, "WiFi OK!");
+            snprintf(line, sizeof(line), "NTP%.*s",
+                     (dots % 4) + 1, "....");
+            oled_fb_string(0, 3, line);
+            oled_fb_string(0, 4, "Hora local...");
+        }
+
+        oled_flush();
+        dots++;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // Breve pantalla de "todo listo"
+    oled_fb_clear();
+    oled_fb_string(0, 0, "SmartWireless");
+    oled_fb_string(0, 2, "WiFi  OK");
+    oled_fb_string(0, 3, "NTP   OK");
+    oled_fb_string(0, 4, "Sensores OK");
+    oled_flush();
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    // ---- FASE 2: monitor normal ----
     while (true) {
         alert_level_t lv;
         xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
@@ -133,8 +184,21 @@ void task_oled(void *arg)
         bool         fing = g_finger_oled;
         fall_state_t fst  = g_fall_state_display;
 
+        // Hora local (linea 0)
+        time_t now;
+        struct tm ti;
+        char hora[16] = "--:--:--";
+        if (g_ntp_ready) {
+            time(&now);
+            localtime_r(&now, &ti);
+            if (ti.tm_year >= (2024 - 1900)) {
+                snprintf(hora, sizeof(hora), "%02d:%02d:%02d",
+                         ti.tm_hour, ti.tm_min, ti.tm_sec);
+            }
+        }
+
         oled_fb_clear();
-        oled_fb_string(0, 0, "=Monitor Vital=");
+        oled_fb_string(0, 0, hora);
 
         if (!fing)        snprintf(line, sizeof(line), "BPM: ---");
         else if (bpm > 0) snprintf(line, sizeof(line), "BPM: %3d bpm", bpm);
@@ -156,10 +220,10 @@ void task_oled(void *arg)
             case VITAL_FALL:      servo_ang = 180; break;
             default:              servo_ang = 0;   break;
         }
-        snprintf(line, sizeof(line), "Alert:%s Srv:%3d", alert_str[lv], servo_ang);
+        snprintf(line, sizeof(line), "Alt:%s Srv:%3d", alert_str[lv], servo_ang);
         oled_fb_string(0, 4, line);
 
-        oled_fb_string(0, 5, fing ? "Dedo: presente " : "Dedo: ausente  ");
+        oled_fb_string(0, 5, fing ? "Dedo: presente" : "Dedo: ausente ");
 
         oled_flush();
         vTaskDelay(pdMS_TO_TICKS(500));
