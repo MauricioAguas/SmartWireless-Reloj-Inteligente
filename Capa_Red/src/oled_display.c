@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 static const char *TAG_OLED = "OLED";
 
@@ -80,6 +81,27 @@ void oled_flush(void)
 }
 
 // =========================================================================
+//  Hora NTP: obtiene string "HH:MM:SS" o "Sin hora" si aun no sincroniza
+// =========================================================================
+
+static void get_time_string(char *out, size_t len)
+{
+    time_t now;
+    struct tm timeinfo;
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // tm_year cuenta desde 1900; si es menor a 2024 aun no hay hora valida
+    if (timeinfo.tm_year < (2024 - 1900)) {
+        snprintf(out, len, "Sin hora");
+        return;
+    }
+
+    strftime(out, len, "%H:%M:%S", &timeinfo);
+}
+
+// =========================================================================
 //  Inicializacion del panel
 // =========================================================================
 
@@ -104,6 +126,11 @@ void oled_init(i2c_master_bus_handle_t i2c_bus)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(oled_panel_hdl));
     ESP_ERROR_CHECK(esp_lcd_panel_init(oled_panel_hdl));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(oled_panel_hdl, true));
+
+    // Zona horaria Colombia (UTC-5, sin cambio de horario)
+    setenv("TZ", "COT5", 1);
+    tzset();
+
     ESP_LOGI(TAG_OLED, "SSD1306 inicializado OK");
 }
 
@@ -114,6 +141,8 @@ void oled_init(i2c_master_bus_handle_t i2c_bus)
 void task_oled(void *arg)
 {
     char line[22];
+    char hora[12];
+
     static const char *alert_str[] = { "OK  ", "BPM!", "SpO2", "FALL" };
     static const char *fall_str[]  = {
         "Idle    ", "FreeFall", "ImpWait ",
@@ -133,22 +162,29 @@ void task_oled(void *arg)
         bool         fing = g_finger_oled;
         fall_state_t fst  = g_fall_state_display;
 
+        // --- Linea 0: Hora real NTP ---
+        get_time_string(hora, sizeof(hora));
+        snprintf(line, sizeof(line), "%s", hora);
         oled_fb_clear();
-        oled_fb_string(0, 0, "=Monitor Vital=");
+        oled_fb_string(0, 0, line);
 
+        // --- Linea 1: BPM ---
         if (!fing)        snprintf(line, sizeof(line), "BPM: ---");
         else if (bpm > 0) snprintf(line, sizeof(line), "BPM: %3d bpm", bpm);
         else              snprintf(line, sizeof(line), "BPM: calcul...");
         oled_fb_string(0, 1, line);
 
+        // --- Linea 2: SpO2 ---
         if (!fing)         snprintf(line, sizeof(line), "SpO2: ---");
         else if (spo2 > 0) snprintf(line, sizeof(line), "SpO2: %2d%%", spo2);
         else               snprintf(line, sizeof(line), "SpO2: calcul...");
         oled_fb_string(0, 2, line);
 
+        // --- Linea 3: Estado MPU6050 ---
         snprintf(line, sizeof(line), "MPU: %s", fall_str[fst < 6 ? fst : 0]);
         oled_fb_string(0, 3, line);
 
+        // --- Linea 4: Alerta + angulo servo ---
         int servo_ang = 0;
         switch (lv) {
             case VITAL_WARN_BPM:  servo_ang = 45;  break;
@@ -159,6 +195,7 @@ void task_oled(void *arg)
         snprintf(line, sizeof(line), "Alert:%s Srv:%3d", alert_str[lv], servo_ang);
         oled_fb_string(0, 4, line);
 
+        // --- Linea 5: Presencia de dedo ---
         oled_fb_string(0, 5, fing ? "Dedo: presente " : "Dedo: ausente  ");
 
         oled_flush();
