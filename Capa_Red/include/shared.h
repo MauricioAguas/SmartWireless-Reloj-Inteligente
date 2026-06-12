@@ -35,3 +35,7 @@ extern volatile int            g_bpm_display;
 extern volatile int            g_spo2_display;
 extern volatile bool           g_finger_oled;
 extern volatile fall_state_t   g_fall_state_display;
+
+// Flags de arranque (escritos desde main.c, leidos por task_oled)
+extern volatile bool g_wifi_ready;
+extern volatile bool g_ntp_ready;

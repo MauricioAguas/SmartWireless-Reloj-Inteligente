@@ -41,7 +41,7 @@ static const uint8_t font5x8[][5] = {
     {0x63,0x14,0x08,0x14,0x63},{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
     {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},{0x40,0x40,0x40,0x40,0x40},
     {0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},
-    {0x38,0x44,0x44,0x48,0x7F},{0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
+    {0x38,0x44,0x44,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
     {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},{0x7F,0x10,0x28,0x44,0x00},
     {0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},
     {0x7C,0x14,0x14,0x14,0x08},{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
@@ -81,23 +81,24 @@ void oled_flush(void)
 }
 
 // =========================================================================
-//  Hora NTP: obtiene string "HH:MM:SS" o "Sin hora" si aun no sincroniza
+//  Hora NTP: aplica TZ Colombia y devuelve "HH:MM:SS" o "Sin hora"
 // =========================================================================
 
 static void get_time_string(char *out, size_t len)
 {
+    // Asegurar TZ Colombia aqui mismo, independiente de cuando se llamo oled_init
+    setenv("TZ", "COT5", 1);
+    tzset();
+
     time_t now;
     struct tm timeinfo;
-
     time(&now);
     localtime_r(&now, &timeinfo);
 
-    // tm_year cuenta desde 1900; si es menor a 2024 aun no hay hora valida
     if (timeinfo.tm_year < (2024 - 1900)) {
         snprintf(out, len, "Sin hora");
         return;
     }
-
     strftime(out, len, "%H:%M:%S", &timeinfo);
 }
 
@@ -125,13 +126,13 @@ void oled_init(i2c_master_bus_handle_t i2c_bus)
     ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(oled_io_hdl, &panel_cfg, &oled_panel_hdl));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(oled_panel_hdl));
     ESP_ERROR_CHECK(esp_lcd_panel_init(oled_panel_hdl));
+
+    // Rotar 180 grados (mirror en ambos ejes)
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(oled_panel_hdl, true, true));
+
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(oled_panel_hdl, true));
 
-    // Zona horaria Colombia (UTC-5, sin cambio de horario)
-    setenv("TZ", "COT5", 1);
-    tzset();
-
-    ESP_LOGI(TAG_OLED, "SSD1306 inicializado OK");
+    ESP_LOGI(TAG_OLED, "SSD1306 inicializado OK (rotado 180)");
 }
 
 // =========================================================================
@@ -151,6 +152,38 @@ void task_oled(void *arg)
 
     ESP_LOGI(TAG_OLED, "Tarea OLED iniciada");
 
+    // ---------------------------------------------------------------
+    //  Fase boot: esperar WiFi y NTP mostrando progreso en pantalla
+    // ---------------------------------------------------------------
+    while (!g_wifi_ready) {
+        oled_fb_clear();
+        oled_fb_string(0, 0, "SmartWireless");
+        oled_fb_string(0, 2, "Conectando");
+        oled_fb_string(0, 3, "WiFi...");
+        oled_flush();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    oled_fb_clear();
+    oled_fb_string(0, 0, "SmartWireless");
+    oled_fb_string(0, 2, "WiFi OK!");
+    oled_fb_string(0, 3, "Sync NTP...");
+    oled_flush();
+
+    while (!g_ntp_ready) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    oled_fb_clear();
+    oled_fb_string(0, 0, "SmartWireless");
+    oled_fb_string(0, 2, "NTP OK!");
+    oled_fb_string(0, 3, "Iniciando...");
+    oled_flush();
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    // ---------------------------------------------------------------
+    //  Loop principal de monitoreo
+    // ---------------------------------------------------------------
     while (true) {
         alert_level_t lv;
         xSemaphoreTake(g_alert_mutex, portMAX_DELAY);
@@ -162,29 +195,29 @@ void task_oled(void *arg)
         bool         fing = g_finger_oled;
         fall_state_t fst  = g_fall_state_display;
 
-        // --- Linea 0: Hora real NTP ---
+        // Linea 0: Hora NTP
         get_time_string(hora, sizeof(hora));
         snprintf(line, sizeof(line), "%s", hora);
         oled_fb_clear();
         oled_fb_string(0, 0, line);
 
-        // --- Linea 1: BPM ---
+        // Linea 1: BPM
         if (!fing)        snprintf(line, sizeof(line), "BPM: ---");
         else if (bpm > 0) snprintf(line, sizeof(line), "BPM: %3d bpm", bpm);
         else              snprintf(line, sizeof(line), "BPM: calcul...");
         oled_fb_string(0, 1, line);
 
-        // --- Linea 2: SpO2 ---
+        // Linea 2: SpO2
         if (!fing)         snprintf(line, sizeof(line), "SpO2: ---");
         else if (spo2 > 0) snprintf(line, sizeof(line), "SpO2: %2d%%", spo2);
         else               snprintf(line, sizeof(line), "SpO2: calcul...");
         oled_fb_string(0, 2, line);
 
-        // --- Linea 3: Estado MPU6050 ---
+        // Linea 3: Estado MPU6050
         snprintf(line, sizeof(line), "MPU: %s", fall_str[fst < 6 ? fst : 0]);
         oled_fb_string(0, 3, line);
 
-        // --- Linea 4: Alerta + angulo servo ---
+        // Linea 4: Alerta + angulo servo
         int servo_ang = 0;
         switch (lv) {
             case VITAL_WARN_BPM:  servo_ang = 45;  break;
@@ -192,10 +225,10 @@ void task_oled(void *arg)
             case VITAL_FALL:      servo_ang = 180; break;
             default:              servo_ang = 0;   break;
         }
-        snprintf(line, sizeof(line), "Alert:%s Srv:%3d", alert_str[lv], servo_ang);
+        snprintf(line, sizeof(line), "Alrt:%s Srv:%3d", alert_str[lv], servo_ang);
         oled_fb_string(0, 4, line);
 
-        // --- Linea 5: Presencia de dedo ---
+        // Linea 5: Presencia de dedo
         oled_fb_string(0, 5, fing ? "Dedo: presente " : "Dedo: ausente  ");
 
         oled_flush();

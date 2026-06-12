@@ -117,7 +117,8 @@ void actuators_init(void)
     };
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&sc, &rc, &rgb_strip));
 
-    rgb_set(0, 40, 0);
+    // LED apagado al inicio — se encendera solo si hay alerta
+    rgb_off();
     buzzer_off();
 }
 
@@ -134,18 +135,20 @@ void actuators_update(void)
 
     switch (lv) {
     case VITAL_NORMAL:
-        rgb_set(0, 255, 0);
+        // Estado normal: LED apagado, servo en 0
+        rgb_off();
         servo_set_angle(0);
         break;
     case VITAL_WARN_BPM:
-        rgb_set(255, 80, 0);
+        rgb_set(255, 80, 0);   // Naranja
         servo_set_angle(45);
         break;
     case VITAL_WARN_SPO2:
-        rgb_set(0, 0, 255);
+        rgb_set(0, 0, 255);    // Azul
         servo_set_angle(90);
         break;
     case VITAL_FALL:
+        // Manejado por actuators_fall_alert()
         break;
     }
 }
