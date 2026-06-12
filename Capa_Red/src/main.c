@@ -39,26 +39,14 @@
    WIFI + MQTT
    ========================================================= */
 
-#define WIFI_SSID "Sergio"
-#define WIFI_PASS "0987654321"
+#define WIFI_SSID        "RaspberryIoT420"
+#define WIFI_PASS        "12345678"
 
-#define MQTT_BROKER_URI   "mqtts://raspberrypi.local:8883"
-#define MQTT_TOPIC_DATA   "monitor/paciente/data"
+#define MQTT_BROKER_URI  "mqtts://192.168.50.1:8883"
+#define MQTT_TOPIC_DATA  "monitor/paciente/data"
 
-/*
- * NTP local: apunta a la Raspberry Pi en lugar de pool.ntp.org
- * La Raspberry mantiene su hora interna con chrony/timedatectl
- * sin necesitar internet. El ESP32 la consulta via la misma red WiFi.
- *
- * Opciones (usa la primera que funcione en tu red):
- *   "raspberrypi.local"  -> mDNS, funciona si avahi-daemon esta activo
- *   "192.168.4.1"        -> IP del AP de la Raspberry (modo hotspot)
- *
- * Si ninguna resuelve, habilita NTP en la Raspberry:
- *   sudo systemctl enable --now chrony   (o ntp)
- *   sudo timedatectl set-ntp true
- */
-#define NTP_SERVER   "192.168.4.1"
+// NTP: misma IP que el broker MQTT — la Raspberry sirve su hora local
+#define NTP_SERVER       "192.168.50.1"
 
 static const char *TAG = "APP_MAIN";
 
@@ -202,7 +190,6 @@ static void wifi_init(void)
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
@@ -216,30 +203,32 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
     ESP_LOGI(TAG, "Conectando a WiFi '%s'...", WIFI_SSID);
 }
 
 /* =========================================================
-   NTP — usa la Raspberry como servidor de hora local.
-   La Raspberry NO necesita internet: chrony/timedatectl
-   mantiene su RTC y lo sirve por NTP en la red local.
+   NTP local apuntando a la Raspberry (192.168.50.1)
 
-   Para habilitarlo en la Raspberry (una sola vez):
+   REQUISITO en la Raspberry (ejecutar una sola vez):
+
      sudo apt install chrony -y
-     sudo nano /etc/chrony/chrony.conf
-       -> agrega al final:  local stratum 8 orphan
+     echo "local stratum 8 orphan" | sudo tee -a /etc/chrony/chrony.conf
+     echo "allow 192.168.50.0/24"  | sudo tee -a /etc/chrony/chrony.conf
      sudo systemctl restart chrony
 
-   Luego verifica desde otra maquina:
-     chronyc sources
+   Verificar que funciona:
+     chronyc tracking          <- muestra hora local
+     chronyc clients           <- debe aparecer 192.168.50.x del ESP32
+
+   Si no tienes chrony instalado aun, verifica con:
+     timedatectl               <- debe decir NTP service: active
    ========================================================= */
 
 static void obtain_time(void)
 {
-    ESP_LOGI(TAG, "Sincronizando hora con servidor local: %s", NTP_SERVER);
+    ESP_LOGI(TAG, "Sincronizando hora con Raspberry: %s", NTP_SERVER);
 
-    // Zona horaria Colombia (UTC-5, sin horario de verano)
+    // Zona horaria Colombia (UTC-5, sin DST)
     setenv("TZ", "COT5", 1);
     tzset();
 
@@ -261,28 +250,23 @@ static void obtain_time(void)
         time(&now);
         localtime_r(&now, &timeinfo);
 
-        ESP_LOGI(TAG, "NTP intento %d/%d — year=%d",
+        ESP_LOGI(TAG, "NTP intento %d/%d - anio=%d",
                  retry + 1, retry_max, timeinfo.tm_year + 1900);
 
         if (timeinfo.tm_year >= (2024 - 1900)) {
             g_ntp_ready = true;
             ESP_LOGI(TAG, "Hora OK: %04d-%02d-%02d %02d:%02d:%02d (COT)",
-                     timeinfo.tm_year + 1900,
-                     timeinfo.tm_mon  + 1,
-                     timeinfo.tm_mday,
-                     timeinfo.tm_hour,
-                     timeinfo.tm_min,
-                     timeinfo.tm_sec);
+                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1,
+                     timeinfo.tm_mday, timeinfo.tm_hour,
+                     timeinfo.tm_min,  timeinfo.tm_sec);
             return;
         }
         retry++;
     }
 
-    // Si despues de 40 s no llego la hora, continua sin bloquear
-    // el OLED mostrara "Sin hora" pero el resto del sistema funciona
+    // Timeout: continua sin hora para no bloquear el sistema
     g_ntp_ready = true;
-    ESP_LOGE(TAG, "No se pudo sincronizar hora desde %s. "
-                  "Verifica que chrony este activo en la Raspberry.", NTP_SERVER);
+    ESP_LOGE(TAG, "Timeout NTP. Verifica chrony en la Raspberry (%s).", NTP_SERVER);
 }
 
 /* =========================================================
@@ -301,17 +285,14 @@ static void mqtt_event_handler(
             mqtt_connected = true;
             ESP_LOGI(TAG, "MQTT conectado");
             break;
-
         case MQTT_EVENT_DISCONNECTED:
             mqtt_connected = false;
             ESP_LOGW(TAG, "MQTT desconectado");
             break;
-
         case MQTT_EVENT_ERROR:
             mqtt_connected = false;
             ESP_LOGE(TAG, "Error MQTT");
             break;
-
         default:
             break;
     }
@@ -324,8 +305,8 @@ static void mqtt_event_handler(
 static void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri              = MQTT_BROKER_URI,
-        .broker.verification.certificate = ca_cert,
+        .broker.address.uri                     = MQTT_BROKER_URI,
+        .broker.verification.certificate        = ca_cert,
         .credentials.authentication.certificate = client_cert,
         .credentials.authentication.key         = client_key,
     };
@@ -338,7 +319,6 @@ static void mqtt_app_start(void)
 
     ESP_ERROR_CHECK(esp_mqtt_client_register_event(
         mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
-
     ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
 }
 
@@ -378,7 +358,6 @@ static void mqtt_publish_task(void *pvParameters)
 
         int msg_id = esp_mqtt_client_publish(
             mqtt_client, MQTT_TOPIC_DATA, payload, 0, 1, 0);
-
         ESP_LOGI(TAG, "MQTT pub id=%d %s", msg_id, payload);
 
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -400,23 +379,23 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Mutex antes de cualquier tarea
+    // Mutex primero, antes de cualquier tarea
     g_alert_mutex = xSemaphoreCreateMutex();
     configASSERT(g_alert_mutex);
 
-    // WiFi — event-driven, g_wifi_ready se pone true en el handler
+    // WiFi (asincrono, g_wifi_ready se activa en el event handler)
     wifi_init();
 
-    // Esperar IP real antes de pedir hora
-    ESP_LOGI(TAG, "Esperando conexion WiFi...");
+    // Bloquear hasta tener IP real
+    ESP_LOGI(TAG, "Esperando IP de la Raspberry...");
     while (!g_wifi_ready) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    // NTP apuntando a la Raspberry local
+    // NTP desde la Raspberry local
     obtain_time();
 
-    // MQTT sobre TLS usando certs del broker en la Raspberry
+    // MQTT TLS
     mqtt_app_start();
 
     // Bus I2C compartido
