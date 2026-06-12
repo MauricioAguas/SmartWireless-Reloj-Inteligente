@@ -13,20 +13,47 @@
 static const char *TAG_MPU = "MPU6050";
 
 // =========================================================================
-//  Umbrales y tiempos de la maquina de estados
+//  Umbrales y tiempos - ajustados para uso en muñeca
+//
+//  Cambios respecto al prototipo en protoboard:
+//
+//  FREEFALL_THRESH_G : 0.4 -> 0.25  El brazo en movimiento normal
+//                                    puede bajar a ~0.4 g tranquilamente.
+//                                    0.25 g exige una caída libre real.
+//
+//  FREEFALL_TIME_MS  : 80  -> 120   Más tiempo para confirmar que no es
+//                                    un movimiento brusco de brazo.
+//
+//  IMPACT_THRESH_G   : 2.0 -> 3.0   Golpes cotidianos (mesa, puerta)
+//                                    llegan a 2-2.5 g en la muñeca.
+//                                    Una caída real supera 3.5-5 g.
+//
+//  IMPACT_WINDOW_MS  : 500 -> 600   Ventana un poco más generosa para
+//                                    capturar el impacto secundario.
+//
+//  POSTURE_THRESH_G  : 1.6 -> 1.2   Tras la caída la persona queda
+//                                    quieta; 1.2 g cubre esa postura.
+//
+//  POSTURE_WINDOW_MS : 2000-> 2500  Más tiempo para confirmar inmovilidad
+//                                    post-caída.
+//
+//  JOLT_THRESH_G     : 3.5 -> 4.5   Evita falsos jolt por gestos fuertes.
+//
+//  EMA_ALPHA         : 0.25-> 0.15  Filtro más suave = señal más estable,
+//                                    menos picos espúreos.
 // =========================================================================
 
 #define CALIB_SAMPLES       200
-#define FREEFALL_THRESH_G   0.4f
-#define FREEFALL_TIME_MS    80
-#define IMPACT_THRESH_G     2.0f
-#define IMPACT_WINDOW_MS    500
-#define POSTURE_THRESH_G    1.6f
-#define POSTURE_WINDOW_MS   2000
-#define JOLT_THRESH_G       3.5f
+#define FREEFALL_THRESH_G   0.25f
+#define FREEFALL_TIME_MS    120
+#define IMPACT_THRESH_G     3.0f
+#define IMPACT_WINDOW_MS    600
+#define POSTURE_THRESH_G    1.2f
+#define POSTURE_WINDOW_MS   2500
+#define JOLT_THRESH_G       4.5f
 #define COOLDOWN_MS         5000
 #define TASK_PERIOD_MS      10
-#define EMA_ALPHA           0.25f
+#define EMA_ALPHA           0.15f
 
 static float offset_ax = 0, offset_ay = 0, offset_az = 0;
 static float offset_gx = 0, offset_gy = 0, offset_gz = 0;
